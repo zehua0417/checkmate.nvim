@@ -1,4 +1,4 @@
-*checkmate.txt*         For Neovim >= 0.10.0        Last change: 2025 April 12
+*checkmate.txt*         For Neovim >= 0.10.0        Last change: 2025 April 18
 
 ==============================================================================
 Table of Contents                                *checkmate-table-of-contents*
@@ -7,21 +7,29 @@ Table of Contents                                *checkmate-table-of-contents*
 2. Usage                                                     |checkmate-usage|
 3. Commands                                               |checkmate-commands|
 4. Config                                                   |checkmate-config|
+5. Roadmap                                                 |checkmate-roadmap|
+6. Contributing                                       |checkmate-contributing|
+7. Credits                                                 |checkmate-credits|
+8. Links                                                     |checkmate-links|
 
-Inspired by the Todo+ <https://github.com/fabiospampinato/vscode-todo-plus> VS
-Code extension (credit to @fabiospampinato
-<https://github.com/fabiospampinato>)
 
-- Stored as plain text/Markdown format
-- Custom symbols
-- Custom colors
-- Multi-line toggle
+
+A markdown-based todo list manager for Neovim with a clean UI, multi-line
+support, and full customization options.
+
+- Stores todos in plain Markdown format (compatible with other apps)
+- Unicode symbol support for more beautiful todo items
+- Customizable markers and colors
+- Multi-line todo item support with hierarchical toggling
+- Visual mode support for toggling multiple items at once
+- Full keyboard shortcut customization
 
 
 ==============================================================================
 1. Installation                                       *checkmate-installation*
 
-- install using lazy.nvim <https://github.com/folke/lazy.nvim>
+
+USING LAZY.NVIM ~
 
 >lua
     {
@@ -40,47 +48,62 @@ Code extension (credit to @fabiospampinato
 2. Usage                                                     *checkmate-usage*
 
 
-1. OPEN A .TODO FILE OR CREATE A NEW ONE
+1. OPEN OR CREATE A TODO FILE
 
-As of now, the plugin is only activated when a buffer with `.todo` extension is
-opened.
+- Create or open a file with the `.todo` extension
+- The plugin automatically activates for `.todo` files, treating them as Markdown
 
 
-2. CREATE TODO ITEMS!
+  As of now, the plugin is only activated when a buffer with `.todo` extension is
+  opened.
 
-- Use mapped keys or commands
+2. CREATE TODO ITEMS
 
-or
-
-- Create them manually using typical Markdown format:
+- Use `:CheckmateCreate` command or the mapped key (default: `<leader>Tn`)
+- Or manually using Markdown syntax:
 
 >md
     - [ ] Unchecked todo
     - [x] Checked todo
 <
 
-These will automatically convert when you leave insert mode!
+(These will automatically convert when you leave insert mode!)
 
 
 3. MANAGE YOUR TASKS
 
-- Toggle unchecked checked (can select multiple todo items at once)
+- Toggle items with `:CheckmateToggle` (default: `<leader>Tt`)
+- Check items with `:CheckmateCheck` (default: `<leader>Td`)
+- Uncheck items with `:CheckmateUncheck` (default: `<leader>Tu`)
+- Select multiple items in visual mode and use the same commands
 
 
 ==============================================================================
 3. Commands                                               *checkmate-commands*
 
 
-                                               *checkmate-:Checkmate-toggle*
+                                                *checkmate-:CheckmateToggle*
 
 
-:Checkmate toggle                      Toggle the todo item under the cursor (normal mode) or all todo items within the selection (visual mode)
+:CheckmateToggle                       Toggle the todo item under the cursor (normal mode) or all todo items within the selection (visual mode)
 
 
-                                               *checkmate-:Checkmate-create*
+                                                *checkmate-:CheckmateCreate*
 
 
-:Checkmate create                      Convert the current line to a todo item
+:CheckmateCreate                       Convert the current line to a todo item
+
+
+                                                 *checkmate-:CheckmateCheck*
+
+
+:CheckmateCheck                        Mark todo item as checked (done/completed)
+
+
+                                               *checkmate-:CheckmateUncheck*
+
+
+:CheckmateUncheck                      Mark todo item as unchecked
 
 
 
@@ -99,6 +122,12 @@ These will automatically convert when you leave insert mode!
     ---@field default_list_marker "-" | "*" | "+" Default list item marker to be used when creating new Todo items
     ---@field style checkmate.StyleSettings Highlight settings
     ---@field enter_insert_after_new boolean Enter insert mode after `:Checkmate create`
+    --- Depth within a todo item's hierachy from which actions (e.g. toggle) will act on the parent todo item
+    --- Examples:
+    --- 0 = toggle only triggered when cursor/selection includes same line as the todo item/marker
+    --- 1 = toggle triggered when cursor/selection includes any direct child of todo item
+    --- 2 = toggle triggered when cursor/selection includes any 2nd level children of todo item
+    ---@field todo_action_depth integer
     
     ---@class checkmate.LogSettings
     --- Any messages above this level will be logged
@@ -131,11 +160,22 @@ These will automatically convert when you leave insert mode!
     ---@field checked string Character used for checked items
     
     ---@class checkmate.StyleSettings Customize the style of markers and content
-    ---@field list_marker vim.api.keyset.highlight Highlight settings for list markers
-    ---@field unchecked vim.api.keyset.highlight Highlight settings for unchecked markers
-    ---@field unchecked_content vim.api.keyset.highlight Highlight settings for unchecked content (todo item text)
-    ---@field checked vim.api.keyset.highlight Highlight settings for checked markers
-    ---@field checked_content vim.api.keyset.highlight Highlight settings for checked content (todo item text)
+    ---@field list_marker_unordered vim.api.keyset.highlight Highlight settings for unordered list markers (-,+,*)
+    ---@field list_marker_ordered vim.api.keyset.highlight Highlight settings for ordered (numerical) list markers (1.,2.)
+    ---@field unchecked_marker vim.api.keyset.highlight Highlight settings for unchecked markers
+    ---Highlight settings for main content of unchecked todo items
+    ---This is typically the first line/paragraph
+    ---@field unchecked_main_content vim.api.keyset.highlight
+    ---Highlight settings for additional content of unchecked todo items
+    ---This is the content below the first line/paragraph
+    ---@field unchecked_additional_content vim.api.keyset.highlight
+    ---@field checked_marker vim.api.keyset.highlight Highlight settings for checked markers
+    ---Highlight settings for main content of checked todo items
+    ---This is typically the first line/paragraph
+    ---@field checked_main_content vim.api.keyset.highlight
+    ---Highlight settings for additional content of checked todo items
+    ---This is the content below the first line/paragraph
+    ---@field checked_additional_content vim.api.keyset.highlight
     
     ---@type checkmate.Config
     local _DEFAULTS = {
@@ -150,25 +190,65 @@ These will automatically convert when you leave insert mode!
       keys = {
         ["<leader>Tt"] = "toggle", -- Toggle todo item
         ["<leader>Tn"] = "create", -- Create todo item
+        ["<leader>Td"] = "check", -- Set todo item as checked (done)
+        ["<leader>Tu"] = "uncheck", -- Set todo item as unchecked (not done)
       },
-      default_list_marker = "-",
+    
+      default_list_marker = "-", -- When creating new todos
       todo_markers = {
         unchecked = "□",
         checked = "✔",
       },
-      style = {
-        list_marker = { fg = "#888888" },
-        unchecked = { fg = "#ff9500", bold = true },
-        unchecked_content = { fg = "#ffffff" },
-        checked = { fg = "#00cc66", bold = true },
-        checked_content = { fg = "#aaaaaa", strikethrough = true },
+      style = { -- see nvim_set_hl()
+        list_marker_unordered = { fg = util.blend(util.color("Normal", "fg"), util.color("Normal", "bg"), 0.2) },
+        list_marker_ordered = { fg = util.blend(util.color("Normal", "fg"), util.color("Normal", "bg"), 0.5) },
+        -- Unchecked todos
+        unchecked_marker = { fg = "#ff9500", bold = true }, -- The marker itself
+        unchecked_main_content = { fg = "#ffffff" }, -- Direct content of the todo item
+        unchecked_additional_content = { fg = "#dddddd" }, -- Child content that inherits
+    
+        -- Checked todos
+        checked_marker = { fg = "#00cc66", bold = true }, -- The marker itself
+        checked_main_content = { fg = "#aaaaaa", strikethrough = true }, -- Direct content
+        checked_additional_content = { fg = "#aaaaaa" }, -- Child content (without strikethrough)
       },
-      enter_insert_after_new = false,
+      enter_insert_after_new = true,
+      todo_action_depth = 1,
     }
 <
 
 Note: `checkmate.StyleSettings` uses highlight definition maps to define the
 colors/style, refer to |nvim_set_hl()|
+
+
+==============================================================================
+5. Roadmap                                                 *checkmate-roadmap*
+
+Planned features: 1. **Metadata support** - mappings for quick addition of
+metadata/tags such as @start, @done, @due, @priority, etc. with custom
+highlighting 2. **Archiving** - manually or automatically move completed items
+to the bottom of the document
+
+
+==============================================================================
+6. Contributing                                       *checkmate-contributing*
+
+If you have feature suggestions or ideas, please feel free to open an issue on
+GitHub!
+
+
+==============================================================================
+7. Credits                                                 *checkmate-credits*
+
+- Inspired by the Todo+ <https://github.com/fabiospampinato/vscode-todo-plus> VS Code extension (credit to @fabiospampinato <https://github.com/fabiospampinato>)
+
+==============================================================================
+8. Links                                                     *checkmate-links*
+
+1. *@start*: 
+2. *@done*: 
+3. *@due*: 
+4. *@priority*: 
 
 Generated by panvimdoc <https://github.com/kdheepak/panvimdoc>
 
