@@ -32,8 +32,7 @@ support, and full customization options.
 
 REQUIREMENTS                             *checkmate-installation-requirements*
 
-- Neovim 10.2 or higher
-- nvim-treesitter with the markdown parser installed
+- Neovim 0.10 or higher
 
 
 USING LAZY.NVIM ~
@@ -41,9 +40,6 @@ USING LAZY.NVIM ~
 >lua
     {
         "bngarren/checkmate.nvim",
-        dependencies = {
-          "nvim-treesitter/nvim-treesitter",
-        },
         opts = {
             -- your configuration here
             -- or leave empty to use defaults
