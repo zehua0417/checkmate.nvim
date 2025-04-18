@@ -32,7 +32,7 @@ support, and full customization options.
 
 REQUIREMENTS                             *checkmate-installation-requirements*
 
-- Neovim 0.8 or higher
+- Neovim 10.2 or higher
 - nvim-treesitter with the markdown parser installed
 
 
@@ -49,7 +49,6 @@ USING LAZY.NVIM ~
             -- or leave empty to use defaults
         },
     
-        }
     }
 <
 
