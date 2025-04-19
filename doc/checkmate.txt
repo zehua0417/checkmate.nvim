@@ -1,4 +1,4 @@
-*checkmate.txt*         For Neovim >= 0.10.0        Last change: 2025 April 18
+*checkmate.txt*         For Neovim >= 0.10.0        Last change: 2025 April 19
 
 ==============================================================================
 Table of Contents                                *checkmate-table-of-contents*
@@ -24,6 +24,11 @@ support, and full customization options.
 - Multi-line todo item support with hierarchical toggling
 - Visual mode support for toggling multiple items at once
 - Full keyboard shortcut customization
+
+
+
+
+https://github.com/user-attachments/assets/ac18f810-2bf7-40a7-96d7-9de492c75445
 
 
 ==============================================================================
@@ -210,8 +215,8 @@ USING LAZY.NVIM ~
       },
       style = {
         -- List markers, such as "-" and "1."
-        list_marker_unordered = { fg = util.blend(util.color("Normal", "fg"), util.color("Normal", "bg"), 0.2) },
-        list_marker_ordered = { fg = util.blend(util.color("Normal", "fg"), util.color("Normal", "bg"), 0.5) },
+        list_marker_unordered = { fg = "#666666" },
+        list_marker_ordered = { fg = "#333333" },
     
         -- Unchecked todo items
         unchecked_marker = { fg = "#ff9500", bold = true }, -- The marker itself
@@ -237,8 +242,9 @@ colors/style, refer to |nvim_set_hl()|
 
 Planned features: 1. **Metadata support** - mappings for quick addition of
 metadata/tags such as @start, @done, @due, @priority, etc. with custom
-highlighting 2. **Archiving** - manually or automatically move completed items
-to the bottom of the document
+highlighting
+
+1. **Archiving** - manually or automatically move completed items to the bottom of the document
 
 
 ==============================================================================
