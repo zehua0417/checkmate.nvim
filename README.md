@@ -19,6 +19,16 @@ A markdown-based todo list manager for Neovim with a clean UI, multi-line suppor
 - Visual mode support for toggling multiple items at once
 - Full keyboard shortcut customization
 
+<br/>
+
+
+
+https://github.com/user-attachments/assets/ac18f810-2bf7-40a7-96d7-9de492c75445
+
+
+
+
+
 # ☑️ Installation
 
 ## Requirements
@@ -171,8 +181,8 @@ local _DEFAULTS = {
   },
   style = {
     -- List markers, such as "-" and "1."
-    list_marker_unordered = { fg = util.blend(util.color("Normal", "fg"), util.color("Normal", "bg"), 0.2) },
-    list_marker_ordered = { fg = util.blend(util.color("Normal", "fg"), util.color("Normal", "bg"), 0.5) },
+    list_marker_unordered = { fg = "#666666" },
+    list_marker_ordered = { fg = "#333333" },
 
     -- Unchecked todo items
     unchecked_marker = { fg = "#ff9500", bold = true }, -- The marker itself
@@ -194,6 +204,7 @@ Note: `checkmate.StyleSettings` uses highlight definition maps to define the col
 # Roadmap
 Planned features:
 1. **Metadata support** - mappings for quick addition of metadata/tags such as @start, @done, @due, @priority, etc. with custom highlighting
+
 2. **Archiving** - manually or automatically move completed items to the bottom of the document
 
 # Contributing
