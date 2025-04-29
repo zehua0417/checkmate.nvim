@@ -14,9 +14,16 @@ local M = {}
 --- @field node TSNode Treesitter node containing content
 --- @field type string Type of content node (e.g., "paragraph")
 
+---@class checkmate.MetadataEntry
+---@field tag string The tag name
+---@field value string The value
+---@field range {start: {row: integer, col: integer}, ['end']: {row: integer, col: integer}} Position range
+---@field alias_for? string The canonical tag name if this is an alias
+---@field position_in_line integer
+
 ---@class checkmate.TodoMetadata
----@field start_date string
----@field end_date string
+---@field entries checkmate.MetadataEntry[] List of metadata entries
+---@field by_tag table<string, checkmate.MetadataEntry> Quick access by tag name
 
 --- @class checkmate.TodoItem
 --- @field state checkmate.TodoItemState The todo state
@@ -25,7 +32,7 @@ local M = {}
 --- @field content_nodes ContentNodeInfo[] List of content nodes
 --- @field todo_marker TodoMarkerInfo Information about the todo marker
 --- @field list_marker ListMarkerInfo? Information about the list marker
---- @field metadata checkmate.TodoMetadata | {} Meta tags for the todo item
+--- @field metadata checkmate.TodoMetadata | {} Metadata for this todo item
 --- @field todo_text string Text content of the todo item line (first line), may be truncated. Only for debugging.
 --- @field children string[] IDs of child todo items
 --- @field parent_id string? ID of parent todo item
@@ -117,6 +124,9 @@ function M.setup()
       -- Re-apply highlight groups after a small delay
       vim.defer_fn(function()
         highlights.setup_highlights()
+
+        -- Clear the dynamic highlight cache to ensure they're recreated with the new colorscheme
+        highlights.clear_highlight_cache()
       end, 10)
     end,
   })
@@ -272,11 +282,6 @@ function M.get_todo_item_at_position(bufnr, row, col, opts)
   local root = M.get_markdown_tree_root(bufnr)
   local node = root:named_descendant_for_range(row, col, row, col)
 
-  log.debug(
-    string.format("Looking for todo item at position [%d,%d] with max_depth=%d", row, col, max_depth),
-    { module = "parser" }
-  )
-
   -- First, check if any todo items exist on this row
   -- This handles the case where the cursor is not in the todo item's Treesitter node's range, but
   -- should still act as if this todo item was selected (same row)
@@ -394,7 +399,7 @@ function M.discover_todos(bufnr)
         or config.options.todo_markers.unchecked
       local todo_marker_pos = first_line:find(todo_marker, 1, true)
 
-      local metadata = M.extract_metadata(first_line)
+      local metadata = M.extract_metadata(first_line, start_row)
 
       -- Initialize the todo item entry
       todo_map[node_id] = {
@@ -420,10 +425,10 @@ function M.discover_todos(bufnr)
       }
 
       -- Find and store list marker information
-      M.find_list_marker_info(node, bufnr, todo_map[node_id])
+      M.update_list_marker_info(node, bufnr, todo_map[node_id])
 
       -- Find and store content nodes
-      M.find_content_nodes(node, bufnr, todo_map[node_id])
+      M.update_content_nodes(node, bufnr, todo_map[node_id])
     end
   end
 
@@ -433,10 +438,10 @@ function M.discover_todos(bufnr)
   return todo_map
 end
 
--- Find list marker information
-function M.find_list_marker_info(node, bufnr, todo_item)
-  -- Find all child nodes that could be list markers
-  local list_marker_query = vim.treesitter.query.parse(
+---Returns a TS query for finding markdown list_markers
+---@return vim.treesitter.Query
+function M.get_list_marker_query()
+  return vim.treesitter.query.parse(
     "markdown",
     [[
     (list_marker_minus) @list_marker_minus
@@ -444,13 +449,30 @@ function M.find_list_marker_info(node, bufnr, todo_item)
     (list_marker_star) @list_marker_star
     (list_marker_dot) @list_marker_ordered
     (list_marker_parenthesis) @list_marker_ordered
-  ]]
+    ]]
   )
+end
+
+---Returns the list_marker type as "unordered" or "ordered"
+---@param capture_name string A capture name returned from a TS query
+---@return string: "ordered" or "unordered"
+function M.get_marker_type_from_capture_name(capture_name)
+  local is_ordered = capture_name:match("ordered") ~= nil
+  return is_ordered and "ordered" or "unordered"
+end
+
+---Finds the markdown list_marker associated with the given node and updates the todo_item's
+---list_marker field
+---@param node TSNode The list_item node of a todo item
+---@param bufnr integer Buffer number
+---@param todo_item checkmate.TodoItem
+function M.update_list_marker_info(node, bufnr, todo_item)
+  -- Find all child nodes that could be list markers
+  local list_marker_query = M.get_list_marker_query()
 
   for id, marker_node, _ in list_marker_query:iter_captures(node, bufnr, 0, -1) do
     local name = list_marker_query.captures[id]
-    local is_ordered = name:match("ordered") ~= nil
-    local marker_type = is_ordered and "ordered" or "unordered"
+    local marker_type = M.get_marker_type_from_capture_name(name)
 
     -- Verify this marker is a direct child of this list_item
     local parent = marker_node:parent()
@@ -469,7 +491,7 @@ function M.find_list_marker_info(node, bufnr, todo_item)
 end
 
 -- Find content nodes (paragraphs, etc.)
-function M.find_content_nodes(node, bufnr, todo_item)
+function M.update_content_nodes(node, bufnr, todo_item)
   -- Find child nodes containing content
   local content_query = vim.treesitter.query.parse(
     "markdown",
@@ -538,18 +560,82 @@ function M.get_markdown_tree_root(bufnr)
   return root
 end
 
----Returns the todo item metadata for a given line, or empty table
----@param line any
----@return checkmate.TodoMetadata | {}
-function M.extract_metadata(line)
+---Extracts metadata from a line and returns structured information
+---@param line string The line to extract metadata from
+---@param row integer The row number (0-indexed)
+---@return checkmate.TodoMetadata
+function M.extract_metadata(line, row)
   local log = require("checkmate.log")
-  ---@type checkmate.TodoMetadata | {}
-  local metadata = {}
+  local config = require("checkmate.config")
 
-  -- Match all @key(value) patterns
-  for key, value in line:gmatch("@(%w+)%((.-)%)") do
-    log.debug(("metadata found: %s=%s"):format(key, value), { module = "parser" })
-    metadata[key] = value
+  ---@type checkmate.TodoMetadata
+  local metadata = {
+    entries = {},
+    by_tag = {},
+  }
+  ---Tags must begin with a letter, but can then contain letters, digits, underscores, or hyphens
+  local tag_value_pattern = "@([%a][%w_%-]*)%(%s*(.-)%s*%)"
+
+  -- Find all @tag(value) patterns and their positions
+  local pos = 1
+  while true do
+    -- Will capture tag names that include underscores and hypens
+    local tag_start, tag_end, tag, value = line:find(tag_value_pattern, pos)
+    if not tag_start or not tag_end then
+      break
+    end
+
+    -- Create metadata entry with position information
+    ---@type checkmate.MetadataEntry
+    local entry = {
+      tag = tag,
+      value = value,
+      range = {
+        start = { row = row, col = tag_start - 1 }, -- 0-indexed column
+        ["end"] = { row = row, col = tag_end },
+      },
+      alias_for = nil, -- Will be set later if it's an alias
+      position_in_line = tag_start, -- track original position in the line
+    }
+
+    -- Check if this is an alias and map to canonical name
+    for canonical_name, meta_props in pairs(config.options.metadata) do
+      if tag == canonical_name then
+        -- This is a canonical name, no need to set alias_for
+        break
+      end
+
+      -- Check if it's in the aliases
+      for _, alias in ipairs(meta_props.aliases or {}) do
+        if tag == alias then
+          entry.alias_for = canonical_name
+          break
+        end
+      end
+
+      if entry.alias_for then
+        break
+      end
+    end
+
+    -- Add to entries list
+    table.insert(metadata.entries, entry)
+
+    -- Store in by_tag lookup (last one wins if multiple with same tag)
+    metadata.by_tag[tag] = entry
+
+    -- If this is an alias, also store under canonical name
+    if entry.alias_for then
+      metadata.by_tag[entry.alias_for] = entry
+    end
+
+    -- Move position for next search
+    pos = tag_end + 1
+
+    log.debug(
+      string.format("Metadata found: %s=%s at [%d,%d]-[%d,%d]", tag, value, row, tag_start - 1, row, tag_end),
+      { module = "parser" }
+    )
   end
 
   return metadata
