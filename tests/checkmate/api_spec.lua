@@ -441,5 +441,116 @@ describe("API", function()
         os.remove(file_path)
       end)
     end)
+
+    it("should remove all metadata from todo items", function()
+      local config = require("checkmate.config")
+      local unchecked = config.options.todo_markers.unchecked
+
+      local file_path = h.create_temp_file()
+
+      local tags_on_removed_called = false
+
+      --Setup an on_remove callback so that we can verify it is called when the tag is removed
+      ---@diagnostic disable-next-line: missing-fields
+      config.setup({
+        metadata = {
+          ---@diagnostic disable-next-line: missing-fields
+          tags = {
+            on_remove = function()
+              tags_on_removed_called = true
+            end,
+          },
+        },
+      })
+
+      -- Initial content with todos that have multiple metadata tags
+      local content = [[
+# Todo Metadata Test
+
+- ]] .. unchecked .. [[ Task with @priority(high) @due(2023-05-15) @tags(important,urgent)
+- ]] .. unchecked .. [[ Another task @priority(medium) @assigned(john)
+- ]] .. unchecked .. [[ A todo without metadata
+]]
+
+      -- Setup buffer with the content
+      local bufnr = setup_todo_buffer(file_path, content)
+
+      -- 1. Find the first todo item
+      local todo_map = require("checkmate.parser").discover_todos(bufnr)
+      local first_todo = nil
+
+      for _, todo in pairs(todo_map) do
+        if vim.startswith(todo.todo_text, "- " .. unchecked .. " Task with") then
+          first_todo = todo
+          break
+        end
+      end
+
+      if not first_todo then
+        error("missing first todo")
+      end
+
+      -- Verify it has multiple metadata entries
+      assert.is_not_nil(first_todo.metadata)
+      assert.is_true(#first_todo.metadata.entries > 0)
+
+      -- 2. Remove all metadata
+      vim.api.nvim_win_set_cursor(0, { first_todo.range.start.row + 1, 0 }) -- adjust from 0 index to 1-indexed
+      require("checkmate").remove_all_metadata()
+
+      vim.cmd("sleep 10m")
+      local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+
+      -- 3. Verify metadata was removed
+      assert.not_matches("@priority", lines[3], "Metadata tag 'priority' should be removed")
+      assert.not_matches("@due", lines[3], "Metadata tag 'due' should be removed")
+      assert.not_matches("@tags", lines[3], "Metadata tag 'tags' should be removed")
+      assert.matches("- " .. vim.pesc(unchecked) .. " Task with", lines[3], "Todo item text should remain")
+
+      -- Also verify that on_remove callback was called for @tags tag
+      assert.is_true(tags_on_removed_called)
+
+      -- 4. Test removal in visual mode for multiple todos
+      local second_todo = nil
+      local third_todo = nil
+      for _, todo in pairs(todo_map) do
+        if vim.startswith(todo.todo_text, "- " .. unchecked .. " Another task") then
+          second_todo = todo
+        end
+        if vim.startswith(todo.todo_text, "- " .. unchecked .. " A todo without") then
+          third_todo = todo
+        end
+      end
+
+      if not second_todo then
+        error("missing second todo!")
+      end
+      if not third_todo then
+        error("missing third todo!")
+      end
+
+      vim.api.nvim_win_set_cursor(0, { first_todo.range.start.row + 1, 0 })
+      vim.cmd("normal! V")
+      vim.api.nvim_win_set_cursor(0, { third_todo.range.start.row + 1, 0 })
+
+      -- Remove all metadata in visual mode
+      require("checkmate").remove_all_metadata()
+
+      vim.cmd("sleep 10m")
+      lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+
+      -- Verify second todo's metadata was removed
+      assert.not_matches("@priority", lines[4], "Metadata tag 'priority' should be removed from second todo")
+      assert.not_matches("@assigned", lines[4], "Metadata tag 'assigned' should be removed from second todo")
+
+      -- Verify third todo's line text wasn't changed
+      assert.matches("A todo without metadata", lines[5], "Todo item without metadata should not be affected")
+
+      finally(function()
+        -- Clean up
+        vim.api.nvim_buf_delete(bufnr, { force = true })
+        os.remove(file_path)
+      end)
+    end)
   end)
 end)

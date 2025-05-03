@@ -68,6 +68,10 @@ function M.setup_keymaps(bufnr)
       command = "CheckmateCreate",
       modes = { "n" },
     },
+    remove_all_metadata = {
+      command = "CheckmateRemoveAllMetadata",
+      modes = { "n", "v" },
+    },
   }
 
   for key, action_name in pairs(keys) do
@@ -565,7 +569,7 @@ function M.apply_metadata(todo_item, opts)
   -- Update the line
   vim.api.nvim_buf_set_lines(bufnr, todo_row, todo_row + 1, false, { new_line })
 
-  require("checkmate.highlights").apply_highlighting(bufnr, { debug_reason = "apply_metadata_new" })
+  require("checkmate.highlights").apply_highlighting(bufnr, { debug_reason = "apply_metadata" })
 
   return true
 end
@@ -633,7 +637,7 @@ function M.remove_metadata(todo_item, opts)
     -- Update the line
     vim.api.nvim_buf_set_lines(bufnr, todo_row, todo_row + 1, false, { new_line })
 
-    require("checkmate.highlights").apply_highlighting(bufnr, { debug_reason = "apply_metadata_new" })
+    require("checkmate.highlights").apply_highlighting(bufnr, { debug_reason = "remove_metadata" })
 
     log.debug("Removed metadata: " .. entry.tag, { module = "api" })
     return true
@@ -693,6 +697,50 @@ function M.toggle_metadata(todo_item, opts)
       custom_value = custom_value,
     })
   end
+end
+
+---Removes all metadata from a todo item
+---@param todo_item checkmate.TodoItem
+---@return boolean: Success
+function M.remove_all_metadata(todo_item)
+  if not todo_item then
+    return false
+  end
+
+  local log = require("checkmate.log")
+  local config = require("checkmate.config")
+
+  local bufnr = vim.api.nvim_get_current_buf()
+
+  -- Loop through each metadata entry and run its on_remove callback, if present
+  for _, entry in ipairs(todo_item.metadata.entries) do
+    local meta_config = config.options.metadata[entry.tag] or config.options.metadata[entry.alias_for] or {}
+    if meta_config.on_remove then
+      log.debug(("running on_remove callback for todo_item on row %d"):format(todo_item.range.start.row + 1))
+      meta_config.on_remove(todo_item)
+    end
+  end
+
+  todo_item.metadata.entries = {}
+  todo_item.metadata.by_tag = {}
+
+  local updated_metadata = vim.deepcopy(todo_item.metadata)
+
+  local row = todo_item.range.start.row
+
+  local line = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1]
+
+  -- Rebuild the line with sorted metadata
+  local new_line = M.rebuild_line_with_sorted_metadata(line, updated_metadata)
+
+  -- Update the line
+  vim.api.nvim_buf_set_lines(bufnr, row, row + 1, false, { new_line })
+
+  require("checkmate.highlights").apply_highlighting(bufnr, { debug_reason = "remove_all_metadata" })
+
+  log.debug("Removed all metadata from todo item on row " .. row + 1, { module = "api" })
+
+  return true
 end
 
 ---A callback function passed to `apply_todo_operation` that will act on the given todo_item
