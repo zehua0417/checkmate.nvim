@@ -168,16 +168,14 @@ describe("API", function()
         end
       end
 
-      assert.is_not_nil(task_2)
+      if not task_2 then
+        error("missing todo item (task_2)")
+      end
 
       -- Toggle task 2 to checked
-      local err, toggled = api.handle_toggle(bufnr, nil, nil, {
-        existing_todo_item = task_2,
-      })
+      local success = require("checkmate").set_todo_item(task_2, "checked")
 
-      assert.is_nil(err)
-      ---@diagnostic disable-next-line: need-check-nil
-      assert.equals("checked", toggled.state)
+      assert.is_true(success)
 
       -- Save the file
       vim.cmd("write")
@@ -335,10 +333,7 @@ describe("API", function()
       assert.equals(3, #parent_todo.children, "Parent should have 3 children")
 
       -- Toggle parent to checked
-      require("checkmate.api").handle_toggle(bufnr, nil, nil, {
-        existing_todo_item = parent_todo,
-        target_state = "checked",
-      })
+      require("checkmate").set_todo_item(parent_todo, "checked")
 
       -- Get updated content
       local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
@@ -434,6 +429,384 @@ describe("API", function()
       assert.matches("- %[x%] Task 1", saved_content)
       assert.matches("- %[ %] Task 2 @priority%(high%)", saved_content)
       assert.matches("- %[x%] Task 3", saved_content)
+
+      finally(function()
+        -- Clean up
+        vim.api.nvim_buf_delete(bufnr, { force = true })
+        os.remove(file_path)
+      end)
+    end)
+
+    it("should remove all metadata from todo items", function()
+      local config = require("checkmate.config")
+      local unchecked = config.options.todo_markers.unchecked
+
+      local file_path = h.create_temp_file()
+
+      local tags_on_removed_called = false
+
+      --Setup an on_remove callback so that we can verify it is called when the tag is removed
+      ---@diagnostic disable-next-line: missing-fields
+      config.setup({
+        metadata = {
+          ---@diagnostic disable-next-line: missing-fields
+          tags = {
+            on_remove = function()
+              tags_on_removed_called = true
+            end,
+          },
+        },
+      })
+
+      -- Initial content with todos that have multiple metadata tags
+      local content = [[
+# Todo Metadata Test
+
+- ]] .. unchecked .. [[ Task with @priority(high) @due(2023-05-15) @tags(important,urgent)
+- ]] .. unchecked .. [[ Another task @priority(medium) @assigned(john)
+- ]] .. unchecked .. [[ A todo without metadata
+]]
+
+      -- Setup buffer with the content
+      local bufnr = setup_todo_buffer(file_path, content)
+
+      -- 1. Find the first todo item
+      local todo_map = require("checkmate.parser").discover_todos(bufnr)
+      local first_todo = nil
+
+      for _, todo in pairs(todo_map) do
+        if vim.startswith(todo.todo_text, "- " .. unchecked .. " Task with") then
+          first_todo = todo
+          break
+        end
+      end
+
+      if not first_todo then
+        error("missing first todo")
+      end
+
+      -- Verify it has multiple metadata entries
+      assert.is_not_nil(first_todo.metadata)
+      assert.is_true(#first_todo.metadata.entries > 0)
+
+      -- 2. Remove all metadata
+      vim.api.nvim_win_set_cursor(0, { first_todo.range.start.row + 1, 0 }) -- adjust from 0 index to 1-indexed
+      require("checkmate").remove_all_metadata()
+
+      vim.cmd("sleep 10m")
+      local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+
+      -- 3. Verify metadata was removed
+      assert.not_matches("@priority", lines[3], "Metadata tag 'priority' should be removed")
+      assert.not_matches("@due", lines[3], "Metadata tag 'due' should be removed")
+      assert.not_matches("@tags", lines[3], "Metadata tag 'tags' should be removed")
+      assert.matches("- " .. vim.pesc(unchecked) .. " Task with", lines[3], "Todo item text should remain")
+
+      -- Also verify that on_remove callback was called for @tags tag
+      assert.is_true(tags_on_removed_called)
+
+      -- 4. Test removal in visual mode for multiple todos
+      local second_todo = nil
+      local third_todo = nil
+      for _, todo in pairs(todo_map) do
+        if vim.startswith(todo.todo_text, "- " .. unchecked .. " Another task") then
+          second_todo = todo
+        end
+        if vim.startswith(todo.todo_text, "- " .. unchecked .. " A todo without") then
+          third_todo = todo
+        end
+      end
+
+      if not second_todo then
+        error("missing second todo!")
+      end
+      if not third_todo then
+        error("missing third todo!")
+      end
+
+      vim.api.nvim_win_set_cursor(0, { first_todo.range.start.row + 1, 0 })
+      vim.cmd("normal! V")
+      vim.api.nvim_win_set_cursor(0, { third_todo.range.start.row + 1, 0 })
+
+      -- Remove all metadata in visual mode
+      require("checkmate").remove_all_metadata()
+
+      vim.cmd("sleep 10m")
+      lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+
+      -- Verify second todo's metadata was removed
+      assert.not_matches("@priority", lines[4], "Metadata tag 'priority' should be removed from second todo")
+      assert.not_matches("@assigned", lines[4], "Metadata tag 'assigned' should be removed from second todo")
+
+      -- Verify third todo's line text wasn't changed
+      assert.matches("A todo without metadata", lines[5], "Todo item without metadata should not be affected")
+
+      finally(function()
+        -- Clean up
+        vim.api.nvim_buf_delete(bufnr, { force = true })
+        os.remove(file_path)
+      end)
+    end)
+
+    it("should preserve cursor position in all operations", function()
+      local file_path = h.create_temp_file()
+      local config = require("checkmate.config")
+      local unchecked = config.options.todo_markers.unchecked
+      local checked = config.options.todo_markers.checked
+
+      -- Content with multiple todos for testing
+      local content = [[
+# Cursor Position Test
+
+- ]] .. unchecked .. [[ First todo item
+- ]] .. unchecked .. [[ Second todo item
+  - ]] .. unchecked .. [[ Child of second todo
+- ]] .. unchecked .. [[ Third todo item
+- ]] .. checked .. [[ Fourth todo item (already checked)
+
+Normal content line (not a todo)]]
+
+      h.write_file_content(file_path, content)
+      vim.cmd("edit " .. file_path)
+      local bufnr = vim.api.nvim_get_current_buf()
+      vim.bo[bufnr].filetype = "markdown"
+      require("checkmate.api").setup(bufnr)
+
+      -- Test 1: Normal mode with cursor on todo item
+      vim.api.nvim_win_set_cursor(0, { 4, 10 }) -- Line 4, column 10
+      local cursor_before = vim.api.nvim_win_get_cursor(0)
+      require("checkmate").toggle()
+      local cursor_after = vim.api.nvim_win_get_cursor(0)
+      assert.are.same(cursor_before, cursor_after, "Normal mode: cursor should be preserved on todo toggle")
+
+      -- Test 2: Normal mode with cursor on non-todo line
+      vim.api.nvim_win_set_cursor(0, { 9, 5 }) -- Non-todo line
+      cursor_before = vim.api.nvim_win_get_cursor(0)
+      require("checkmate").toggle() -- This should fail (no todo)
+      cursor_after = vim.api.nvim_win_get_cursor(0)
+      assert.are.same(cursor_before, cursor_after, "Normal mode: cursor should be preserved when no todo found")
+
+      -- Test 3: Visual mode with multiple todo items
+      -- Enter visual line mode on lines 3-5
+      vim.cmd("normal! 3GV5G")
+      cursor_before = vim.api.nvim_win_get_cursor(0)
+      require("checkmate").toggle()
+      vim.cmd("normal! \27") -- Escape from any remaining visual mode
+      cursor_after = vim.api.nvim_win_get_cursor(0)
+      assert.are.same(cursor_before, cursor_after, "Visual mode: cursor should be preserved after multi-line operation")
+
+      -- Test 4: Adding metadata in normal mode
+      vim.api.nvim_win_set_cursor(0, { 5, 15 }) -- On a todo line
+      cursor_before = vim.api.nvim_win_get_cursor(0)
+      require("checkmate").add_metadata("priority", "high")
+      cursor_after = vim.api.nvim_win_get_cursor(0)
+      assert.are.same(cursor_before, cursor_after, "Cursor should be preserved when adding metadata in normal mode")
+
+      -- Test 5: Adding metadata in visual mode
+      vim.cmd("normal! 3GV4G") -- Select first and second todo items
+      cursor_before = vim.api.nvim_win_get_cursor(0)
+      require("checkmate").add_metadata("priority", "medium")
+      vim.cmd("normal! \27") -- Escape from any remaining visual mode
+      cursor_after = vim.api.nvim_win_get_cursor(0)
+      assert.are.same(cursor_before, cursor_after, "Cursor should be preserved when adding metadata in visual mode")
+
+      -- Test 6: Removing metadata in normal and visual modes
+      -- First add metadata to a todo item
+      vim.api.nvim_win_set_cursor(0, { 6, 15 }) -- Child todo item
+      require("checkmate").add_metadata("due", "tomorrow")
+
+      -- Now test removing it in normal mode
+      cursor_before = vim.api.nvim_win_get_cursor(0)
+      require("checkmate").remove_metadata("due")
+      cursor_after = vim.api.nvim_win_get_cursor(0)
+      assert.are.same(cursor_before, cursor_after, "Cursor should be preserved when removing metadata in normal mode")
+
+      -- Add metadata to multiple items for visual mode test
+      vim.cmd("normal! 3GV4G") -- Select first and second todo items
+      require("checkmate").add_metadata("tags", "test")
+      vim.cmd("normal! \27") -- Escape
+
+      -- Now test removing in visual mode
+      vim.cmd("normal! 3GV4G") -- Select same items again
+      cursor_before = vim.api.nvim_win_get_cursor(0)
+      require("checkmate").remove_metadata("tags")
+      vim.cmd("normal! \27") -- Escape
+      cursor_after = vim.api.nvim_win_get_cursor(0)
+      assert.are.same(cursor_before, cursor_after, "Cursor should be preserved when removing metadata in visual mode")
+
+      finally(function()
+        -- Clean up
+        vim.api.nvim_buf_delete(bufnr, { force = true })
+        os.remove(file_path)
+      end)
+    end)
+  end)
+
+  describe("metadata callbacks", function()
+    it("should call on_add only when metadata is successfully added", function()
+      -- Set up a test file
+      local file_path = h.create_temp_file()
+      local unchecked = require("checkmate.config").options.todo_markers.unchecked
+
+      -- Initial content with one todo
+      local content = "# Metadata Callbacks Test\n\n- " .. unchecked .. " A test todo"
+
+      local bufnr = setup_todo_buffer(file_path, content)
+
+      -- Create a spy to track callback execution
+      local on_add_called = false
+      local test_todo_item = nil
+
+      -- Configure a test metadata tag with on_add callback
+      local config = require("checkmate.config")
+      ---@diagnostic disable-next-line: missing-fields
+      config.setup({
+        metadata = {
+          ---@diagnostic disable-next-line: missing-fields
+          test = {
+            on_add = function(todo_item)
+              on_add_called = true
+              test_todo_item = todo_item
+            end,
+          },
+        },
+      })
+
+      -- Get the todo item at row 2 (0-indexed)
+      local todo_map = require("checkmate.parser").discover_todos(bufnr)
+      local todo_item = nil
+      for _, item in pairs(todo_map) do
+        if item.range.start.row == 2 then
+          todo_item = item
+          break
+        end
+      end
+
+      -- Verify we found the todo
+      if not todo_item then
+        error("missing todo item!")
+      end
+
+      -- Apply the metadata
+      local success = require("checkmate.api").apply_metadata(todo_item, {
+        meta_name = "test",
+        custom_value = "test_value",
+      })
+
+      -- Check that the operation succeeded
+      assert.is_true(success)
+      -- Check that the callback was called
+      assert.is_true(on_add_called)
+      -- Check that the todo item was passed to the callback
+      assert.is_not_nil(test_todo_item)
+      -- Verify the metadata was added
+      local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+      assert.matches("@test%(test_value%)", lines[3])
+
+      -- Reset the callback flag
+      on_add_called = false
+
+      -- Try to apply metadata to a non-existent todo
+      local fake_todo = {
+        range = { start = { row = 999, col = 0 } },
+        metadata = { entries = {}, by_tag = {} },
+      }
+
+      -- This should fail and the callback should not be called
+      success = require("checkmate.api").apply_metadata(fake_todo, {
+        meta_name = "test",
+        custom_value = "test_value",
+      })
+
+      -- Check that the operation failed
+      assert.is_false(success)
+
+      -- Check that the callback was not called
+      assert.is_false(on_add_called)
+
+      finally(function()
+        -- Clean up
+        vim.api.nvim_buf_delete(bufnr, { force = true })
+        os.remove(file_path)
+      end)
+    end)
+
+    it("should call on_remove only when metadata is successfully removed", function()
+      local file_path = h.create_temp_file()
+      local unchecked = require("checkmate.config").options.todo_markers.unchecked
+
+      -- Initial content with one todo with metadata
+      local content = "# Metadata Callbacks Test\n\n- " .. unchecked .. " A test todo @test(test_value)"
+
+      local bufnr = setup_todo_buffer(file_path, content)
+
+      -- Create a spy to track callback execution
+      local on_remove_called = false
+      local test_todo_item = nil
+
+      -- Configure a test metadata tag with on_remove callback
+      local config = require("checkmate.config")
+      ---@diagnostic disable-next-line: missing-fields
+      config.setup({
+        metadata = {
+          ---@diagnostic disable-next-line: missing-fields
+          test = {
+            on_remove = function(todo_item)
+              on_remove_called = true
+              test_todo_item = todo_item
+            end,
+          },
+        },
+      })
+
+      -- Get the todo item at row 2 (0-indexed)
+      local todo_map = require("checkmate.parser").discover_todos(bufnr)
+      local todo_item = nil
+      for _, item in pairs(todo_map) do
+        if item.range.start.row == 2 then
+          todo_item = item
+          break
+        end
+      end
+
+      -- Verify we found the todo
+      if not todo_item then
+        error("missing todo item!")
+      end
+
+      -- Remove the metadata
+      local success = require("checkmate.api").remove_metadata(todo_item, {
+        meta_name = "test",
+      })
+
+      -- Check that the operation succeeded
+      assert.is_true(success)
+      -- Check that the callback was called
+      assert.is_true(on_remove_called)
+      -- Check that the todo item was passed to the callback
+      assert.is_not_nil(test_todo_item)
+      -- Verify the metadata was removed
+      local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+      assert.not_matches("@test", lines[3])
+
+      -- Reset the callback flag
+      on_remove_called = false
+
+      -- Try to remove metadata from a non-existent todo
+      local fake_todo = {
+        range = { start = { row = 999, col = 0 } },
+        metadata = { entries = {}, by_tag = {} },
+      }
+
+      -- This should fail and the callback should not be called
+      success = require("checkmate.api").remove_metadata(fake_todo, {
+        meta_name = "test",
+      })
+
+      -- Check that the operation failed
+      assert.is_false(success)
+      -- Check that the callback was not called
+      assert.is_false(on_remove_called)
 
       finally(function()
         -- Clean up

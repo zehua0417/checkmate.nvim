@@ -66,10 +66,10 @@ end
 
 ---Sets a given todo item to a specific state
 ---@param todo_item checkmate.TodoItem
+---@param target_state checkmate.TodoItemState
 function M.set_todo_item(todo_item, target_state)
   local api = require("checkmate.api")
-  local bufnr = vim.api.nvim_get_current_buf()
-  api.handle_toggle(bufnr, nil, nil, { existing_todo_item = todo_item, target_state = target_state })
+  return api.toggle_todo_item(todo_item, { target_state = target_state })
 end
 
 --- Set todo item to checked state
@@ -122,6 +122,17 @@ function M.remove_metadata(metadata_name)
     is_visual = is_visual,
     action_name = "remove metadata",
     params = { meta_name = metadata_name },
+  })
+end
+
+function M.remove_all_metadata()
+  local is_visual = require("checkmate.util").is_visual_mode()
+  local api = require("checkmate.api")
+
+  api.apply_todo_operation({
+    operation = api.remove_all_metadata,
+    is_visual = is_visual,
+    action_name = "remove all metadata",
   })
 end
 

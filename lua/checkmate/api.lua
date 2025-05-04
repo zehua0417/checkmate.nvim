@@ -68,6 +68,10 @@ function M.setup_keymaps(bufnr)
       command = "CheckmateCreate",
       modes = { "n" },
     },
+    remove_all_metadata = {
+      command = "CheckmateRemoveAllMetadata",
+      modes = { "n", "v" },
+    },
   }
 
   for key, action_name in pairs(keys) do
@@ -248,33 +252,20 @@ function M.setup_autocmds(bufnr)
   end
 end
 
----Toggles or sets a todo item's state
----@param bufnr integer Buffer number
----@param line_row integer? Row to search for todo item
----@param col integer? Col to search for todo item
----@param opts? {existing_todo_item?: checkmate.TodoItem, target_state?: "checked"|"unchecked"} Options
----@return string? error, checkmate.TodoItem? todo_item
-function M.handle_toggle(bufnr, line_row, col, opts)
-  local log = require("checkmate.log")
+---Toggles a todo item from checked to unchecked or vice versa
+---@param todo_item checkmate.TodoItem The todo item to modify
+---@param opts {target_state?: checkmate.TodoItemState, notify: boolean?}
+---@return boolean success Whether the operation succeeded
+function M.toggle_todo_item(todo_item, opts)
   local config = require("checkmate.config")
   local parser = require("checkmate.parser")
   local util = require("checkmate.util")
+  local log = require("checkmate.log")
 
   opts = opts or {}
+  local bufnr = vim.api.nvim_get_current_buf()
 
-  -- Get todo item - either use provided one or find at position
-  local todo_item = opts.existing_todo_item
-  if not todo_item then
-    todo_item = parser.get_todo_item_at_position(bufnr, line_row, col, {
-      max_depth = config.options.todo_action_depth,
-    })
-  end
-
-  if not todo_item then
-    return "No todo item found at position", nil
-  end
-
-  -- Get the line with the todo marker - use the row from the todo_item's range
+  -- Get the line with the todo marker
   local todo_line_row = todo_item.todo_marker.position.row
   local line = vim.api.nvim_buf_get_lines(bufnr, todo_line_row, todo_line_row + 1, false)[1]
 
@@ -282,22 +273,21 @@ function M.handle_toggle(bufnr, line_row, col, opts)
     string.format("Found todo item at (editor) line %d (type: %s)", todo_line_row + 1, todo_item.state),
     { module = "api" }
   )
-  log.debug("Line content: '" .. line .. "'", { module = "api" })
 
   local unchecked_marker = config.options.todo_markers.unchecked
   local checked_marker = config.options.todo_markers.checked
 
-  -- Determine target state based on options
-  -- i.e. do we simply toggle, or do we set to a specific state only?
+  -- Determine target state
   local target_state = opts.target_state
   if not target_state then
     -- Traditional toggle behavior
     target_state = todo_item.state == "unchecked" and "checked" or "unchecked"
   elseif target_state == todo_item.state then
     -- Already in target state, no change needed
-    log.debug("Todo item already in target state: " .. target_state, { module = "api" })
-    util.notify("Todo item is already " .. target_state, log.levels.INFO)
-    return nil, todo_item
+    if opts.notify ~= false then
+      util.notify("Todo item is already " .. target_state, log.levels.INFO)
+    end
+    return true
   end
 
   local patterns, replacement_marker
@@ -305,16 +295,13 @@ function M.handle_toggle(bufnr, line_row, col, opts)
   if target_state == "checked" then
     patterns = util.build_unicode_todo_patterns(parser.list_item_markers, unchecked_marker)
     replacement_marker = checked_marker
-    log.debug("Setting to checked", { module = "api" })
   else
     patterns = util.build_unicode_todo_patterns(parser.list_item_markers, checked_marker)
     replacement_marker = unchecked_marker
-    log.debug("Setting to unchecked", { module = "api" })
   end
 
-  local new_line
-
   -- Try to apply the first matching pattern
+  local new_line
   for _, pattern in ipairs(patterns) do
     local replaced, count = line:gsub(pattern, "%1" .. replacement_marker, 1)
     if count > 0 then
@@ -329,29 +316,11 @@ function M.handle_toggle(bufnr, line_row, col, opts)
 
     -- Update the todo item's state to reflect the change
     todo_item.state = target_state
-
-    return nil, todo_item
+    return true
   else
-    log.error("failed to replace (gsub) todo marker during toggle", { module = "api" })
+    log.error("failed to replace todo marker during toggle", { module = "api" })
+    return false
   end
-
-  return "Failed to update todo item", nil
-end
-
----Toggles a todo item from checked to unchecked or vice versa.
----If a target_state is passed, the todo_item will only be toggled to this state.
----@param todo_item checkmate.TodoItem
----@param opts {target_state: checkmate.TodoItemState?}
----@return boolean
-function M.toggle_todo_item(todo_item, opts)
-  local bufnr = vim.api.nvim_get_current_buf()
-  local target_state = opts and opts.target_state
-  local error, success =
-    M.handle_toggle(bufnr, nil, nil, { existing_todo_item = todo_item, target_state = target_state })
-  if error then
-    require("checkmate.log").error(error, { module = "api" })
-  end
-  return success ~= nil
 end
 
 -- Create a new todo item from the current line
@@ -467,7 +436,6 @@ function M.rebuild_line_with_sorted_metadata(line, metadata)
 
   -- If no metadata entries, just return the cleaned content
   if not metadata or not metadata.entries or #metadata.entries == 0 then
-    log.debug("Removed all metadata tags from line", { module = "parser" })
     return content_without_metadata
   end
 
@@ -508,13 +476,14 @@ function M.apply_metadata(todo_item, opts)
     return false
   end
 
-  if meta_config.on_add then
-    meta_config.on_add(todo_item)
-  end
-
   -- Get the first line of the todo item (where metadata should be added)
   local todo_row = todo_item.range.start.row
   local line = vim.api.nvim_buf_get_lines(bufnr, todo_row, todo_row + 1, false)[1]
+
+  -- This is an error if the todo_item passed in doesn't have a legit line in the buffer...
+  if not line or #line == 0 then
+    return false
+  end
 
   -- Determine the value to insert
   local value = opts.custom_value
@@ -565,7 +534,12 @@ function M.apply_metadata(todo_item, opts)
   -- Update the line
   vim.api.nvim_buf_set_lines(bufnr, todo_row, todo_row + 1, false, { new_line })
 
-  require("checkmate.highlights").apply_highlighting(bufnr, { debug_reason = "apply_metadata_new" })
+  -- Call the on_add callback after successful operation
+  if meta_config.on_add then
+    meta_config.on_add(todo_item)
+  end
+
+  require("checkmate.highlights").apply_highlighting(bufnr, { debug_reason = "apply_metadata" })
 
   return true
 end
@@ -602,13 +576,13 @@ function M.remove_metadata(todo_item, opts)
   end
 
   if entry then
-    local meta_config = config.options.metadata[entry.tag] or config.options.metadata[entry.alias_for] or {}
-    if meta_config.on_remove then
-      meta_config.on_remove(todo_item)
-    end
-
     local todo_row = todo_item.range.start.row
     local line = vim.api.nvim_buf_get_lines(bufnr, todo_row, todo_row + 1, false)[1]
+
+    -- This is an error if the todo_item passed in doesn't have a legit line in the buffer...
+    if not line or #line == 0 then
+      return false
+    end
 
     -- Create updated metadata structure
     local updated_metadata = vim.deepcopy(todo_item.metadata)
@@ -633,7 +607,13 @@ function M.remove_metadata(todo_item, opts)
     -- Update the line
     vim.api.nvim_buf_set_lines(bufnr, todo_row, todo_row + 1, false, { new_line })
 
-    require("checkmate.highlights").apply_highlighting(bufnr, { debug_reason = "apply_metadata_new" })
+    -- Call the on_remove callback if successful
+    local meta_config = config.options.metadata[entry.tag] or config.options.metadata[entry.alias_for] or {}
+    if meta_config.on_remove then
+      meta_config.on_remove(todo_item)
+    end
+
+    require("checkmate.highlights").apply_highlighting(bufnr, { debug_reason = "remove_metadata" })
 
     log.debug("Removed metadata: " .. entry.tag, { module = "api" })
     return true
@@ -695,14 +675,78 @@ function M.toggle_metadata(todo_item, opts)
   end
 end
 
+---Removes all metadata from a todo item
+---@param todo_item checkmate.TodoItem
+---@return boolean: Success
+function M.remove_all_metadata(todo_item)
+  if not todo_item then
+    return false
+  end
+
+  local log = require("checkmate.log")
+  local config = require("checkmate.config")
+
+  local bufnr = vim.api.nvim_get_current_buf()
+
+  -- Store the callbacks to run after successful operation
+  local callbacks = {}
+
+  -- Collect the callbacks, but don't run them yet
+  for _, entry in ipairs(todo_item.metadata.entries) do
+    local meta_config = config.options.metadata[entry.tag] or config.options.metadata[entry.alias_for] or {}
+    if meta_config.on_remove then
+      table.insert(callbacks, {
+        tag = entry.tag,
+        func = meta_config.on_remove,
+      })
+    end
+  end
+
+  todo_item.metadata.entries = {}
+  todo_item.metadata.by_tag = {}
+
+  local updated_metadata = vim.deepcopy(todo_item.metadata)
+
+  local row = todo_item.range.start.row
+
+  local line = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1]
+
+  -- Rebuild the line with sorted metadata
+  local new_line = M.rebuild_line_with_sorted_metadata(line, updated_metadata)
+
+  -- Update the line
+  vim.api.nvim_buf_set_lines(bufnr, row, row + 1, false, { new_line })
+
+  -- Run all callbacks after successful update
+  for _, item in ipairs(callbacks) do
+    log.debug(
+      ("running on_remove callback for metadata %s on todo_item on row %d"):format(
+        item.tag,
+        todo_item.range.start.row + 1
+      )
+    )
+    item.func(todo_item)
+  end
+
+  require("checkmate.highlights").apply_highlighting(bufnr, { debug_reason = "remove_all_metadata" })
+
+  log.debug("Removed all metadata from todo item on row " .. row + 1, { module = "api" })
+
+  return true
+end
+
 ---A callback function passed to `apply_todo_operation` that will act on the given todo_item
----@alias checkmate.TodoOperation fun(todo_item: checkmate.TodoItem, params: any?): boolean
+---params
+---  notify - whether to allow notify for this operation. This allows notify to be turned off
+---  if an operation is run in visual selection mode, i.e. so we don't get a bunch of notifications for one action
+---@alias checkmate.TodoOperation fun(todo_item: checkmate.TodoItem, params: {notify: boolean?}): boolean
 
 ---@class ApplyTodoOperationOpts table Operation configuration
 ---@field operation checkmate.TodoOperation The operation to perform on each todo item
 ---@field is_visual boolean Whether to process a visual selection (true) or cursor position (false)
 ---@field action_name string Human-readable name of the action (for logging and notifications)
 ---@field params any? Additional parameters to pass to the operation function, excluding the todo_item
+
 ---Apply an operation to todo items either at cursor or in a visual selection
 ---@param opts ApplyTodoOperationOpts
 ---@return table results Operation results { success: boolean, processed: number, succeeded: number, errors: table[] }
@@ -724,7 +768,8 @@ function M.apply_todo_operation(opts)
   -- Collection of todo items to process
   local todo_items = {}
 
-  local restore_cursor
+  -- Save current cursor state
+  local cursor_state = util.Cursor.save()
 
   -- Get todo items based on mode (visual or normal)
   if opts.is_visual then
@@ -760,9 +805,8 @@ function M.apply_todo_operation(opts)
     end
   else
     -- Normal mode - just get the item at cursor
-    local cursor = vim.api.nvim_win_get_cursor(0)
-    local row = cursor[1] - 1 -- 0-indexed
-    local col = cursor[2]
+    local row = cursor_state.cursor[1] - 1 -- 0-indexed
+    local col = cursor_state.cursor[2]
 
     local todo_item =
       parser.get_todo_item_at_position(bufnr, row, col, { max_depth = config.options.todo_action_depth })
@@ -770,9 +814,6 @@ function M.apply_todo_operation(opts)
     if todo_item then
       table.insert(todo_items, todo_item)
     end
-
-    -- Store cursor for later restoration
-    restore_cursor = cursor
   end
 
   -- Process collected todo items
@@ -780,8 +821,12 @@ function M.apply_todo_operation(opts)
     for _, todo_item in ipairs(todo_items) do
       results.processed = results.processed + 1
 
+      -- We pass a notify=false option to the todo operation so that notifications
+      -- can be ignored when multiple todos are being actioned
+      local params = vim.tbl_extend("force", opts.params or {}, { notify = #todo_items < 2 })
+
       -- Apply the operation and catch any errors
-      local success, result = pcall(opts.operation, todo_item, opts.params)
+      local success, result = pcall(opts.operation, todo_item, params)
 
       if success and result then
         results.succeeded = results.succeeded + 1
@@ -819,10 +864,8 @@ function M.apply_todo_operation(opts)
     util.notify(string.format("No todo items found at %s", mode_msg), vim.log.levels.INFO)
   end
 
-  -- Restore cursor in normal mode operations
-  if not opts.is_visual and restore_cursor then
-    vim.api.nvim_win_set_cursor(0, restore_cursor)
-  end
+  -- Restore cursor position
+  util.Cursor.restore(cursor_state)
 
   return results
 end
