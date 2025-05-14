@@ -135,7 +135,7 @@ M.ns = vim.api.nvim_create_namespace("checkmate")
 
 ---@class checkmate.LinterConfig
 ---@field enabled boolean -- (default true) Whether to enable the linter (vim.diagnostics)
----@field severity table<string, vim.diagnostic.Severity> -- Map of issues to diagnostic severity level
+---@field severity table<string, vim.diagnostic.Severity>? -- Map of issues to diagnostic severity level
 --- TODO: @field auto_fix boolean Auto fix on buffer write
 
 -----------------------------------------------------
@@ -144,6 +144,11 @@ local _DEFAULTS = {
   enabled = true,
   notify = true,
   files = { "todo", "TODO", "*.todo*" }, -- matches TODO, TODO.md, .todo.md
+  log = {
+    level = "info",
+    use_file = false,
+    use_buffer = false,
+  },
   -- Default keymappings
   keys = {
     ["<leader>Tt"] = "toggle", -- Toggle todo item
@@ -241,10 +246,8 @@ local _DEFAULTS = {
       sort_order = 30,
     },
   },
-  log = {
-    level = "info",
-    use_file = false,
-    use_buffer = false,
+  linter = {
+    enabled = true,
   },
 }
 

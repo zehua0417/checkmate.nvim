@@ -62,28 +62,22 @@ return function(options)
     local trace = err_obj.trace or {}
     local formatted = ""
 
-    -- Add error header with context
-    formatted = formatted .. colors.red("❯ " .. context) .. "\n"
-
     -- Add error message with proper indentation
-    local first_line = true
+    local first_line = false
     for line in msg:gmatch("[^\r\n]+") do
-      -- Skip duplicated context name in error
-      if first_line and line:match(context) then
-        -- Skip
+      if not first_line then
+        formatted = formatted .. colors.red("➤") .. " " .. line .. "\n"
+        first_line = true
       else
         formatted = formatted .. "  " .. line .. "\n"
       end
-      first_line = false
-    end
-
-    -- Add file/line info if available
-    if trace.short_src and trace.currentline then
-      formatted = formatted .. "  " .. dim_text("at " .. trace.short_src .. ":" .. trace.currentline) .. "\n"
     end
 
     return formatted
   end
+
+  -- Track failed tests for summary
+  local failedTests = {}
 
   -- State
   local indentLevel = 0
@@ -197,10 +191,18 @@ return function(options)
     elseif status == "failure" or status == "error" then
       failCount = failCount + 1
       currentFileFailed = true -- Mark the current file as failed
-      println(indent .. red_mark() .. " " .. name)
+      println(indent .. red_mark() .. " " .. colors.red(name))
 
       -- Get error details
       local t = (status == "failure") and handler.failures[#handler.failures] or handler.errors[#handler.errors]
+
+      println(vim.inspect(t))
+
+      -- Store failed test info for summary
+      table.insert(failedTests, {
+        name = t.name,
+        file = currentFile,
+      })
 
       -- Format and display error
       local error_indent = indent .. "  "
@@ -220,24 +222,6 @@ return function(options)
   handler.error = function(element, message, parent, trace)
     currentFileFailed = true
 
-    local err_obj = {
-      message = message,
-      trace = trace,
-      name = element and (element.name or element.descriptor),
-    }
-
-    local indent = string.rep("  ", indentLevel)
-    println(indent .. red_mark() .. " " .. colors.red("Error") .. " in " .. (err_obj.name or "unknown context"))
-
-    local error_indent = indent .. "  "
-    local error_lines = format_error(err_obj)
-    for line in error_lines:gmatch("[^\r\n]+") do
-      println(error_indent .. line)
-    end
-
-    println("") -- Add empty line after error
-
-    io_flush()
     return nil, true
   end
 
@@ -279,14 +263,19 @@ return function(options)
     println(result_text)
 
     -- Print test counts
-    local test_text = string_format("Tests       %d passed", passCount)
+    local test_text = "Tests       "
+    if failCount == 0 then
+      test_text = test_text .. colors.green(string_format("%d passed", passCount))
+    else
+      test_text = test_text .. string_format("%d passed", passCount)
+    end
     if failCount > 0 then
-      test_text = test_text .. string_format(", %d failed", failCount)
+      test_text = test_text .. ", " .. colors.red(string_format("%d failed", failCount))
     end
     if skipCount > 0 then
-      test_text = test_text .. string_format(", %d skipped", skipCount)
+      test_text = test_text .. ", " .. colors.yellow(string_format("%d skipped", skipCount))
     end
-    test_text = test_text .. string_format(", %d total", totalTests)
+    test_text = test_text .. string_format(" (%d total)", totalTests)
     println(test_text)
 
     -- Time info - using Busted's own timing for accuracy
@@ -294,7 +283,11 @@ return function(options)
 
     -- Final status line
     if failCount > 0 then
-      println(colors.red("\n✗ Tests failed. See above for more details."))
+      -- Add failed tests summary
+      println("\nFailed Tests:")
+      for i, test in ipairs(failedTests) do
+        println(dim_text(string.format("  %d) ", i)) .. colors.red(test.name) .. dim_text("  " .. test.file))
+      end
     else
       println(colors.green("\n✓ All tests passed!"))
     end
