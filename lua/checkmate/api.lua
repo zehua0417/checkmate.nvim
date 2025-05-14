@@ -186,10 +186,6 @@ function M.setup_keymaps(bufnr)
 end
 
 function M.setup_autocmds(bufnr)
-  local parser = require("checkmate.parser")
-  local log = require("checkmate.log")
-  local util = require("checkmate.util")
-  local config = require("checkmate.config")
   local augroup_name = "CheckmateApiGroup_" .. bufnr
   local augroup = vim.api.nvim_create_augroup(augroup_name, { clear = true })
 
@@ -208,6 +204,10 @@ function M.setup_autocmds(bufnr)
       buffer = bufnr,
       desc = "Checkmate: Convert and save .todo files",
       callback = function()
+        local parser = require("checkmate.parser")
+        local log = require("checkmate.log")
+        local util = require("checkmate.util")
+
         local uv = vim.uv
         local was_modified = vim.bo[bufnr].modified
 
@@ -257,6 +257,9 @@ function M.setup_autocmds(bufnr)
             return false
           end
 
+          -- Convert the main buffer content to Unicode for display
+          parser.convert_markdown_to_unicode(bufnr)
+
           -- Use schedule to set modified flag after command completes
           vim.schedule(function()
             if vim.api.nvim_buf_is_valid(bufnr) then
@@ -283,31 +286,71 @@ function M.setup_autocmds(bufnr)
       buffer = bufnr,
       callback = function()
         if vim.bo[bufnr].modified then
-          parser.convert_markdown_to_unicode(bufnr)
-          local todo_map = require("checkmate.parser").discover_todos(bufnr)
-          require("checkmate.highlights").apply_highlighting(
-            bufnr,
-            { todo_map = todo_map, debug_reason = "autocmd 'TextChanged'" }
-          )
-          require("checkmate.linter").lint_buffer(bufnr)
+          M.process_buffer(bufnr, "InsertLeave")
         end
       end,
     })
 
-    -- Re-apply highlighting when text changes
     vim.api.nvim_create_autocmd({ "TextChanged" }, {
       group = augroup,
       buffer = bufnr,
-      callback = require("checkmate.util").debounce(function()
-        local todo_map = require("checkmate.parser").discover_todos(bufnr)
-        require("checkmate.highlights").apply_highlighting(
-          bufnr,
-          { todo_map = todo_map, debug_reason = "autocmd 'TextChanged'" }
-        )
-        require("checkmate.linter").lint_buffer(bufnr)
-      end, { ms = 10 }),
+      callback = function()
+        M.process_buffer(bufnr, "TextChanged")
+      end,
     })
   end
+end
+
+M._debounced_process_buffer_fns = {}
+M.PROCESS_DEBOUNCE = 50 -- ms
+
+function M.process_buffer(bufnr, reason)
+  local log = require("checkmate.log")
+
+  -- Create a debounced function for this buffer if it doesn't exist
+  if not M._debounced_process_buffer_fns[bufnr] then
+    local function process_buffer_impl()
+      -- Skip if buffer is no longer valid
+      if not vim.api.nvim_buf_is_valid(bufnr) then
+        M._debounced_process_buffer_fns[bufnr] = nil
+        return
+      end
+
+      local parser = require("checkmate.parser")
+      local config = require("checkmate.config")
+      local linter = require("checkmate.linter")
+
+      local start_time = vim.uv.hrtime() / 1000000
+
+      local todo_map = parser.discover_todos(bufnr)
+      parser.convert_markdown_to_unicode(bufnr)
+
+      require("checkmate.highlights").apply_highlighting(
+        bufnr,
+        { todo_map = todo_map, debug_reason = "api process_buffer" }
+      )
+
+      if config.options.linter and config.options.linter.enabled then
+        linter.lint_buffer(bufnr)
+      end
+
+      local end_time = vim.uv.hrtime() / 1000000
+      local elapsed = end_time - start_time
+
+      log.debug(("Buffer processed in %d ms, reason: %s"):format(elapsed, reason or "unknown"), { module = "api" })
+    end
+
+    -- Create a debounced version of the process function
+    M._debounced_process_buffer_fns[bufnr] = require("checkmate.util").debounce(process_buffer_impl, {
+      ms = M.PROCESS_DEBOUNCE,
+    })
+  end
+
+  -- Call the debounced processor - this will reset the timer
+  M._debounced_process_buffer_fns[bufnr]()
+
+  -- Log that the process was scheduled
+  log.debug(("Process scheduled for buffer %d, reason: %s"):format(bufnr, reason or "unknown"), { module = "api" })
 end
 
 ---Toggles a todo item from checked to unchecked or vice versa

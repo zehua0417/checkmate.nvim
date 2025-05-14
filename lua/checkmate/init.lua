@@ -213,6 +213,8 @@ function M._setup_autocommands()
     callback = function(args)
       local bufnr = args.buf
       require("checkmate.config").unregister_buffer(bufnr)
+      -- Reset any API state for this buffer
+      require("checkmate.api")._debounced_process_buffer_fns[bufnr] = nil
     end,
   })
 
