@@ -209,24 +209,59 @@ function M.convert_unicode_to_markdown(bufnr)
   -- Build patterns
   local unchecked = config.options.todo_markers.unchecked
   local checked = config.options.todo_markers.checked
-  local unchecked_patterns = util.build_unicode_todo_patterns(M.list_item_markers, unchecked)
-  local checked_patterns = util.build_unicode_todo_patterns(M.list_item_markers, checked)
+
+  local unchecked_patterns, checked_patterns
+  local ok, err = pcall(function()
+    unchecked_patterns = util.build_unicode_todo_patterns(M.list_item_markers, unchecked)
+    checked_patterns = util.build_unicode_todo_patterns(M.list_item_markers, checked)
+    return true
+  end)
+
+  if not ok then
+    log.error("Error building patterns: " .. tostring(err), { module = "parser" })
+    return false
+  end
 
   -- Create new_lines table
   local new_lines = {}
 
   -- Replace Unicode with markdown syntax
-  for _, line in ipairs(lines) do
+  for i, line in ipairs(lines) do
     local new_line = line
+    local had_error = false
 
-    -- Replace unchecked Unicode markers with "[ ]"
     for _, pattern in ipairs(unchecked_patterns) do
-      new_line = new_line:gsub(pattern, "%1[ ]")
+      ok, err = pcall(function()
+        new_line = new_line:gsub(pattern, "%1[ ]")
+        return true
+      end)
+
+      if not ok then
+        log.error(string.format("Error on line %d with unchecked pattern: %s", i, tostring(err)), { module = "parser" })
+        had_error = true
+        break
+      end
     end
 
-    -- Replace checked Unicode markers with "[x]"
+    if had_error then
+      break
+    end
+
     for _, pattern in ipairs(checked_patterns) do
-      new_line = new_line:gsub(pattern, "%1[x]")
+      ok, err = pcall(function()
+        new_line = new_line:gsub(pattern, "%1[x]")
+        return true
+      end)
+
+      if not ok then
+        log.error(string.format("Error on line %d with checked pattern: %s", i, tostring(err)), { module = "parser" })
+        had_error = true
+        break
+      end
+    end
+
+    if had_error then
+      return false
     end
 
     if new_line ~= line then
@@ -238,12 +273,21 @@ function M.convert_unicode_to_markdown(bufnr)
 
   -- Update buffer if changes were made
   if modified then
-    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, new_lines)
+    ok, err = pcall(function()
+      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, new_lines)
+      return true
+    end)
+
+    if not ok then
+      log.error("Error setting buffer lines: " .. tostring(err), { module = "parser" })
+      return false
+    end
+
     log.debug("Converted Unicode todo symbols to Markdown", { module = "parser" })
     return true
   end
 
-  return false
+  return true
 end
 
 ---@class GetTodoItemAtPositionOpts
