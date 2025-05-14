@@ -52,6 +52,36 @@ M.regular_commands = {
     end,
     opts = { desc = "Remove all metadata from todo item" },
   },
+  {
+    name = "Lint",
+    cmd = "CheckmateLint",
+    func = function()
+      require("checkmate").lint()
+    end,
+    opts = { desc = "Identify Checkmate formatting issues" },
+  },
+  -- TODO: auto-fix
+
+  --[[ {
+    name = "Auto Fix",
+    cmd = "CheckmateFix",
+    func = function()
+      local bufnr = vim.api.nvim_get_current_buf()
+      local linter = require("checkmate.linter")
+      local result, fixed = linter.fix_issues(bufnr)
+
+      if result then
+        if fixed > 0 then
+          vim.notify("Auto fixable issues fixed", vim.log.levels.INFO)
+        else
+          vim.notify("No auto fixable issues found", vim.log.levels.INFO)
+        end
+      else
+        vim.notify("Could not fix auto-fixable issues", vim.log.levels.WARN)
+      end
+    end,
+    opts = { desc = "Check for Markdown formatting issues" },
+  }, ]]
 }
 
 -- Debug commands only available when INCLUDE_DEBUG_COMMANDS is true
