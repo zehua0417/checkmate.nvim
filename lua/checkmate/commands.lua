@@ -119,6 +119,35 @@ M.debug_commands = {
     end,
     opts = { desc = "Print this buffer's todo_map" },
   },
+  {
+    name = "DebugProfilerStart",
+    cmd = "CheckmateDebugProfilerStart",
+    func = function()
+      require("checkmate.profiler").start_session()
+    end,
+    opts = { desc = "Start performance profiling" },
+  },
+  {
+    name = "DebugProfilerStop",
+    cmd = "CheckmateDebugProfilerStop",
+    func = function()
+      local profiler = require("checkmate.profiler")
+      profiler.stop_session()
+    end,
+    opts = { desc = "Stop performance profiling" },
+  },
+  {
+    name = "DebugProfilerReport",
+    cmd = "CheckmateDebugProfilerReport",
+    func = function()
+      local profiler = require("checkmate.profiler")
+      if profiler.is_active() then
+        profiler.stop_session()
+      end
+      require("checkmate.profiler").show_report()
+    end,
+    opts = { desc = "Show performance profiling report" },
+  },
 }
 
 -- Combine commands based on debug flag
