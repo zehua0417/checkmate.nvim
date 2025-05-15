@@ -3,23 +3,23 @@ local M = {}
 ---@alias checkmate.TodoItemState "checked" | "unchecked"
 
 --- @class TodoMarkerInfo
---- @field position {row: integer, col: integer} Position of the marker
+--- @field position {row: integer, col: integer} Position of the marker (0-indexed)
 --- @field text string The marker text (e.g., "□" or "✓")
 
 --- @class ListMarkerInfo
---- @field node TSNode Treesitter node of the list marker
+--- @field node TSNode Treesitter node of the list marker (uses 0-indexed row/col coordinates)
 --- @field type "ordered"|"unordered" Type of list marker
 
 --- @class ContentNodeInfo
---- @field node TSNode Treesitter node containing content
+--- @field node TSNode Treesitter node containing content (uses 0-indexed row/col coordinates)
 --- @field type string Type of content node (e.g., "paragraph")
 
 ---@class checkmate.MetadataEntry
 ---@field tag string The tag name
 ---@field value string The value
----@field range {start: {row: integer, col: integer}, ['end']: {row: integer, col: integer}} Position range
+---@field range {start: {row: integer, col: integer}, ['end']: {row: integer, col: integer}} Position range (0-indexed)
 ---@field alias_for? string The canonical tag name if this is an alias
----@field position_in_line integer
+---@field position_in_line integer (1-indexed)
 
 ---@class checkmate.TodoMetadata
 ---@field entries checkmate.MetadataEntry[] List of metadata entries
@@ -28,10 +28,12 @@ local M = {}
 --- @class checkmate.TodoItem
 --- @field state checkmate.TodoItemState The todo state
 --- @field node TSNode The Treesitter node
---- @field range {start: {row: integer, col: integer}, ['end']: {row: integer, col: integer}} Item range
+--- Todo item's buffer range
+--- The end col is expected to be adjusted (get_semantic_range) so that it accurately reflects the end of the content
+--- @field range {start: {row: integer, col: integer}, ['end']: {row: integer, col: integer}}
 --- @field content_nodes ContentNodeInfo[] List of content nodes
---- @field todo_marker TodoMarkerInfo Information about the todo marker
---- @field list_marker ListMarkerInfo? Information about the list marker
+--- @field todo_marker TodoMarkerInfo Information about the todo marker (0-indexed position)
+--- @field list_marker ListMarkerInfo Information about the list marker (0-indexed position)
 --- @field metadata checkmate.TodoMetadata | {} Metadata for this todo item
 --- @field todo_text string Text content of the todo item line (first line), may be truncated. Only for debugging.
 --- @field children string[] IDs of child todo items
@@ -207,24 +209,59 @@ function M.convert_unicode_to_markdown(bufnr)
   -- Build patterns
   local unchecked = config.options.todo_markers.unchecked
   local checked = config.options.todo_markers.checked
-  local unchecked_patterns = util.build_unicode_todo_patterns(M.list_item_markers, unchecked)
-  local checked_patterns = util.build_unicode_todo_patterns(M.list_item_markers, checked)
+
+  local unchecked_patterns, checked_patterns
+  local ok, err = pcall(function()
+    unchecked_patterns = util.build_unicode_todo_patterns(M.list_item_markers, unchecked)
+    checked_patterns = util.build_unicode_todo_patterns(M.list_item_markers, checked)
+    return true
+  end)
+
+  if not ok then
+    log.error("Error building patterns: " .. tostring(err), { module = "parser" })
+    return false
+  end
 
   -- Create new_lines table
   local new_lines = {}
 
   -- Replace Unicode with markdown syntax
-  for _, line in ipairs(lines) do
+  for i, line in ipairs(lines) do
     local new_line = line
+    local had_error = false
 
-    -- Replace unchecked Unicode markers with "[ ]"
     for _, pattern in ipairs(unchecked_patterns) do
-      new_line = new_line:gsub(pattern, "%1[ ]")
+      ok, err = pcall(function()
+        new_line = new_line:gsub(pattern, "%1[ ]")
+        return true
+      end)
+
+      if not ok then
+        log.error(string.format("Error on line %d with unchecked pattern: %s", i, tostring(err)), { module = "parser" })
+        had_error = true
+        break
+      end
     end
 
-    -- Replace checked Unicode markers with "[x]"
+    if had_error then
+      break
+    end
+
     for _, pattern in ipairs(checked_patterns) do
-      new_line = new_line:gsub(pattern, "%1[x]")
+      ok, err = pcall(function()
+        new_line = new_line:gsub(pattern, "%1[x]")
+        return true
+      end)
+
+      if not ok then
+        log.error(string.format("Error on line %d with checked pattern: %s", i, tostring(err)), { module = "parser" })
+        had_error = true
+        break
+      end
+    end
+
+    if had_error then
+      return false
     end
 
     if new_line ~= line then
@@ -236,13 +273,26 @@ function M.convert_unicode_to_markdown(bufnr)
 
   -- Update buffer if changes were made
   if modified then
-    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, new_lines)
+    ok, err = pcall(function()
+      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, new_lines)
+      return true
+    end)
+
+    if not ok then
+      log.error("Error setting buffer lines: " .. tostring(err), { module = "parser" })
+      return false
+    end
+
     log.debug("Converted Unicode todo symbols to Markdown", { module = "parser" })
     return true
   end
 
-  return false
+  return true
 end
+
+---@class GetTodoItemAtPositionOpts
+---@field todo_map table<string, checkmate.TodoItem>? Pre-parsed todo item map to use instead of performing within function
+---@field max_depth integer? What depth should still register as a parent todo item (0 = only direct, 1 = include children, etc.)
 
 -- Function to find a todo item at a given buffer position
 --  - If on a blank line, will return nil
@@ -252,7 +302,7 @@ end
 ---@param bufnr integer? Buffer number
 ---@param row integer? 0-indexed row
 ---@param col integer? 0-indexed column
----@param opts? { max_depth?: integer } What depth should still register as a parent todo item (0 = only direct, 1 = include children, etc.)
+---@param opts GetTodoItemAtPositionOpts?
 ---@return checkmate.TodoItem? todo_item
 function M.get_todo_item_at_position(bufnr, row, col, opts)
   local log = require("checkmate.log")
@@ -271,7 +321,7 @@ function M.get_todo_item_at_position(bufnr, row, col, opts)
   opts = opts or {}
   local max_depth = opts.max_depth or 0
 
-  local todo_map = M.discover_todos(bufnr)
+  local todo_map = opts.todo_map or M.discover_todos(bufnr)
   local root = M.get_markdown_tree_root(bufnr)
   local node = root:named_descendant_for_range(row, col, row, col)
 
@@ -343,6 +393,7 @@ end
 function M.discover_todos(bufnr)
   local log = require("checkmate.log")
   local config = require("checkmate.config")
+  local util = require("checkmate.util")
   bufnr = bufnr or vim.api.nvim_get_current_buf()
 
   -- Initialize the node map
@@ -375,7 +426,7 @@ function M.discover_todos(bufnr)
 
   -- First pass: Discover all todo items
   for _, node, _ in list_item_query:iter_captures(root, bufnr, 0, -1) do
-    -- Get node information
+    -- Get node information (TS ranges are 0-indexed and end-exclusive)
     local start_row, start_col, end_row, end_col = node:range()
     local node_id = node:id()
 
@@ -387,10 +438,26 @@ function M.discover_todos(bufnr)
       -- This is a todo item, add it to the map
       log.trace("Found todo item at line " .. (start_row + 1) .. ", type: " .. todo_state, { module = "parser" })
 
+      -- Create the raw range first
+      local raw_range = {
+        start = { row = start_row, col = start_col },
+        ["end"] = { row = end_row, col = end_col },
+      }
+
+      -- Get the adjusted range with proper semantic boundaries
+      -- This more meaningful range encompasses the todo content better than the quirky Treesitter technical range for a node
+      local semantic_range = util.get_semantic_range(raw_range, bufnr)
+
       -- Find the todo marker position
       local todo_marker = todo_state == "checked" and config.options.todo_markers.checked
         or config.options.todo_markers.unchecked
+
+      -- Find marker position, defaulting to -1 if not found
+      local marker_col = -1
       local todo_marker_pos = first_line:find(todo_marker, 1, true)
+      if todo_marker_pos then
+        marker_col = todo_marker_pos - 1 -- Adjust for 0-indexing
+      end
 
       local metadata = M.extract_metadata(first_line, start_row)
 
@@ -398,23 +465,21 @@ function M.discover_todos(bufnr)
       todo_map[node_id] = {
         state = todo_state,
         node = node,
-        range = {
-          start = { row = start_row, col = start_col },
-          ["end"] = { row = end_row, col = end_col },
-        },
-        todo_text = vim.api.nvim_buf_get_lines(bufnr, start_row, start_row + 1, false)[1],
+        range = semantic_range,
+        todo_text = first_line,
         content_nodes = {},
         todo_marker = {
           position = {
             row = start_row,
-            col = todo_marker_pos and todo_marker_pos - 1 or -1,
+            col = marker_col,
           },
           text = todo_marker,
         },
-        list_marker = nil, -- Will be set by find_list_marker_info
+        ---@diagnostic disable-next-line: assign-type-mismatch
+        list_marker = nil, -- Will be set by update_list_marker_info
         metadata = metadata,
-        children = {},
-        parent_id = nil, -- Will be set in second pass
+        children = {}, -- Will be set in second pass, if applicable
+        parent_id = nil, -- Will be set in second pass, if applicable
       }
 
       -- Find and store list marker information
@@ -505,37 +570,47 @@ function M.update_content_nodes(node, bufnr, todo_item)
   end
 end
 
--- Build the hierarchy of todo items
+---Build the hierarchy of todo items based on Treesitter's parsing of markdown structure
 ---@param todo_map table<string, checkmate.TodoItem>
+---@return table<string, checkmate.TodoItem> result The updated todo map with hierarchy information
 function M.build_todo_hierarchy(todo_map)
   local log = require("checkmate.log")
 
-  -- For each todo item, find its true parent (if any)
-  for child_id, child_item in pairs(todo_map) do
-    local child_node = child_item.node
+  -- Reset all children arrays and parent_ids
+  for _, item in pairs(todo_map) do
+    item.children = {}
+    item.parent_id = nil
+  end
 
-    -- Get the direct parent node
-    local parent_node = child_node:parent()
+  -- Build parent-child relationships based on Treesitter tree structure
+  for id, todo_item in pairs(todo_map) do
+    local node = todo_item.node
 
-    -- If the parent is a 'list', we need to check if it's part of another list_item
-    -- This helps us determine if this is a nested list or a top-level list
-    if parent_node and parent_node:type() == "list" then
-      local grandparent = parent_node:parent()
+    -- Find the parent list_item node using Treesitter's structure
+    local parent_node = M.find_parent_list_item(node)
 
-      -- If the grandparent is a list_item, this might be a nested list
-      if grandparent and grandparent:type() == "list_item" then
-        -- Get the grandparent's ID
-        local gp_row, gp_col = grandparent:range()
-        local gp_id = grandparent:id()
-        -- Check if grandparent is in our todo map
-        if todo_map[gp_id] then
-          -- This is a nested todo item
-          child_item.parent_id = gp_id
-          table.insert(todo_map[gp_id].children, child_id)
-        end
+    -- If a parent exists, establish the relationship
+    if parent_node then
+      local parent_id = parent_node:id()
+
+      -- Only set parent if it's a todo item
+      if todo_map[parent_id] then
+        todo_item.parent_id = parent_id
+        table.insert(todo_map[parent_id].children, id)
+
+        log.debug(
+          string.format(
+            "Parent-child relationship: '%s' is parent of '%s'",
+            todo_map[parent_id].todo_text:sub(1, 20),
+            todo_item.todo_text:sub(1, 20)
+          ),
+          { module = "parser" }
+        )
       end
     end
   end
+
+  return todo_map
 end
 
 function M.get_markdown_tree_root(bufnr)
@@ -632,6 +707,102 @@ function M.extract_metadata(line, row)
   end
 
   return metadata
+end
+
+-- Helper function to find the parent list_item node of a given list_item node
+---@param node TSNode The list_item node to find the parent for
+---@return TSNode|nil parent_node The parent list_item node, if any
+function M.find_parent_list_item(node)
+  -- In markdown, the hierarchy is typically:
+  -- list_item -> list -> list_item (parent)
+
+  local parent = node:parent()
+
+  -- No parent or parent is root
+  if not parent or parent:type() == "document" then
+    return nil
+  end
+
+  -- In CommonMark, list items are nested inside lists
+  if parent:type() == "list" then
+    local grandparent = parent:parent()
+    if grandparent and grandparent:type() == "list_item" then
+      return grandparent
+    end
+  end
+
+  return nil
+end
+
+function M.get_all_list_items(bufnr)
+  local list_items = {}
+
+  local root = M.get_markdown_tree_root(bufnr)
+  if not root then
+    return {}
+  end
+
+  local list_query = vim.treesitter.query.parse(
+    "markdown",
+    [[
+    (list_item) @list_item
+    ]]
+  )
+
+  -- Collect all list items and their marker information
+  for _, node, _ in list_query:iter_captures(root, bufnr, 0, -1) do
+    local start_row, start_col, end_row, end_col = node:range()
+
+    -- Find the list marker within this list item
+    local marker_node = nil
+    local marker_type = nil
+
+    -- Find direct children that are list markers
+    local marker_query = M.get_list_marker_query()
+    for marker_id, marker, _ in marker_query:iter_captures(node, bufnr, 0, -1) do
+      local name = marker_query.captures[marker_id]
+      local m_type = M.get_marker_type_from_capture_name(name)
+
+      -- Verify this marker is a direct child
+      if marker:parent() == node then
+        marker_node = marker
+        marker_type = m_type
+        break
+      end
+    end
+
+    -- Only add if we found a marker
+    if marker_node then
+      table.insert(list_items, {
+        node = node,
+        range = {
+          start = { row = start_row, col = start_col },
+          ["end"] = { row = end_row, col = end_col },
+        },
+        list_marker = {
+          node = marker_node,
+          type = marker_type,
+        },
+        text = vim.api.nvim_buf_get_lines(bufnr, start_row, start_row + 1, false)[1],
+        -- Find parent relationship
+        parent_node = M.find_parent_list_item(node), -- List item's parent is usually two levels up
+      })
+    end
+  end
+
+  -- Build parent-child relationships
+  for _, item in ipairs(list_items) do
+    -- Initialize children array
+    item.children = {}
+
+    for _, other in ipairs(list_items) do
+      if item.node:id() ~= other.node:id() and other.parent_node == item.node then
+        table.insert(item.children, other.node:id()) -- Store index in our list
+      end
+    end
+  end
+
+  return list_items
 end
 
 return M

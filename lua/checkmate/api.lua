@@ -1,22 +1,65 @@
 ---@class checkmate.Api
 local M = {}
 
-function M.setup(bufnr)
-  local parser = require("checkmate.parser")
-  local highlights = require("checkmate.highlights")
+--- Validates that the buffer is valid (per nvim) and Markdown filetype
+function M.is_valid_buffer(bufnr)
+  if not bufnr or type(bufnr) ~= "number" then
+    vim.notify("Checkmate: Invalid buffer number", vim.log.levels.ERROR)
+    return false
+  end
 
-  bufnr = bufnr or vim.api.nvim_get_current_buf()
-
-  -- Check if buffer is valid
-  if not vim.api.nvim_buf_is_valid(bufnr) then
+  -- pcall to safely check if the buffer is valid
+  local ok, is_valid = pcall(vim.api.nvim_buf_is_valid, bufnr)
+  if not ok or not is_valid then
     vim.notify("Checkmate: Invalid buffer", vim.log.levels.ERROR)
     return false
   end
 
+  -- Only check filetype if buffer actually exists
+  if vim.bo[bufnr].filetype ~= "markdown" then
+    vim.notify("Checkmate: Buffer is not markdown filetype", vim.log.levels.ERROR)
+    return false
+  end
+
+  return true
+end
+
+function M.setup(bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+
+  -- Check if buffer is valid
+  if not M.is_valid_buffer(bufnr) then
+    return false
+  end
+
+  local config = require("checkmate.config")
+
+  -- Check if already set up
+  if vim.b[bufnr].checkmate_setup_complete then
+    return true
+  end
+
+  if not config.is_running() then
+    vim.notify("Failed to initialize plugin", vim.log.levels.ERROR)
+    return false
+  end
+
+  vim.b[bufnr].checkmate_setup_complete = true
+
+  local parser = require("checkmate.parser")
   -- Convert markdown to Unicode
   parser.convert_markdown_to_unicode(bufnr)
 
+  -- Only initialize linter if enabled in config
+  if config.options.linter and config.options.linter.enabled ~= false then
+    local linter = require("checkmate.linter")
+    linter.setup(config.options.linter)
+    -- Initial lint buffer
+    linter.lint_buffer(bufnr)
+  end
+
   -- Apply highlighting
+  local highlights = require("checkmate.highlights")
   highlights.apply_highlighting(bufnr, { debug_reason = "API setup" })
 
   local has_nvim_treesitter, _ = pcall(require, "nvim-treesitter")
@@ -31,6 +74,8 @@ function M.setup(bufnr)
 
   -- Set up auto commands for this buffer
   M.setup_autocmds(bufnr)
+
+  config.register_buffer(bufnr)
 
   return true
 end
@@ -141,9 +186,6 @@ function M.setup_keymaps(bufnr)
 end
 
 function M.setup_autocmds(bufnr)
-  local parser = require("checkmate.parser")
-  local log = require("checkmate.log")
-  local util = require("checkmate.util")
   local augroup_name = "CheckmateApiGroup_" .. bufnr
   local augroup = vim.api.nvim_create_augroup(augroup_name, { clear = true })
 
@@ -162,6 +204,10 @@ function M.setup_autocmds(bufnr)
       buffer = bufnr,
       desc = "Checkmate: Convert and save .todo files",
       callback = function()
+        local parser = require("checkmate.parser")
+        local log = require("checkmate.log")
+        local util = require("checkmate.util")
+
         local uv = vim.uv
         local was_modified = vim.bo[bufnr].modified
 
@@ -178,7 +224,7 @@ function M.setup_autocmds(bufnr)
         if not success then
           log.error("Failed to convert Unicode to Markdown", { module = "api" })
           vim.api.nvim_buf_delete(temp_bufnr, { force = true })
-          util.notify("Failed to save: conversion error", vim.log.levels.ERROR)
+          util.notify("Failed to save when attemping to convert to Markdown", vim.log.levels.ERROR)
           return false
         end
 
@@ -211,12 +257,17 @@ function M.setup_autocmds(bufnr)
             return false
           end
 
+          -- Convert the main buffer content to Unicode for display
+          parser.convert_markdown_to_unicode(bufnr)
+
           -- Use schedule to set modified flag after command completes
           vim.schedule(function()
-            vim.bo[bufnr].modified = false
+            if vim.api.nvim_buf_is_valid(bufnr) then
+              vim.bo[bufnr].modified = false
+            end
           end)
 
-          util.notify("File saved", vim.log.levels.INFO)
+          util.notify("Saved", vim.log.levels.INFO)
         else
           -- Failed to write temp file
           -- Try to clean up
@@ -235,21 +286,71 @@ function M.setup_autocmds(bufnr)
       buffer = bufnr,
       callback = function()
         if vim.bo[bufnr].modified then
-          parser.convert_markdown_to_unicode(bufnr)
-          require("checkmate.highlights").apply_highlighting(bufnr, { debug_reason = "autocmd 'InsertLeave'" })
+          M.process_buffer(bufnr, "InsertLeave")
         end
       end,
     })
 
-    -- Re-apply highlighting when text changes
     vim.api.nvim_create_autocmd({ "TextChanged" }, {
       group = augroup,
       buffer = bufnr,
-      callback = require("checkmate.util").debounce(function()
-        require("checkmate.highlights").apply_highlighting(bufnr, { debug_reason = "autocmd 'TextChanged'" })
-      end, { ms = 10 }),
+      callback = function()
+        M.process_buffer(bufnr, "TextChanged")
+      end,
     })
   end
+end
+
+M._debounced_process_buffer_fns = {}
+M.PROCESS_DEBOUNCE = 50 -- ms
+
+function M.process_buffer(bufnr, reason)
+  local log = require("checkmate.log")
+
+  -- Create a debounced function for this buffer if it doesn't exist
+  if not M._debounced_process_buffer_fns[bufnr] then
+    local function process_buffer_impl()
+      -- Skip if buffer is no longer valid
+      if not vim.api.nvim_buf_is_valid(bufnr) then
+        M._debounced_process_buffer_fns[bufnr] = nil
+        return
+      end
+
+      local parser = require("checkmate.parser")
+      local config = require("checkmate.config")
+      local linter = require("checkmate.linter")
+
+      local start_time = vim.uv.hrtime() / 1000000
+
+      local todo_map = parser.discover_todos(bufnr)
+      parser.convert_markdown_to_unicode(bufnr)
+
+      require("checkmate.highlights").apply_highlighting(
+        bufnr,
+        { todo_map = todo_map, debug_reason = "api process_buffer" }
+      )
+
+      if config.options.linter and config.options.linter.enabled then
+        linter.lint_buffer(bufnr)
+      end
+
+      local end_time = vim.uv.hrtime() / 1000000
+      local elapsed = end_time - start_time
+
+      log.debug(("Buffer processed in %d ms, reason: %s"):format(elapsed, reason or "unknown"), { module = "api" })
+    end
+
+    -- Create a debounced version of the process function
+    M._debounced_process_buffer_fns[bufnr] = require("checkmate.util").debounce(process_buffer_impl, {
+      ms = M.PROCESS_DEBOUNCE,
+    })
+  end
+
+  -- Call the debounced processor - this will reset the timer
+  M._debounced_process_buffer_fns[bufnr]()
+
+  -- Log that the process was scheduled
+  log.debug(("Process scheduled for buffer %d, reason: %s"):format(bufnr, reason or "unknown"), { module = "api" })
 end
 
 ---Toggles a todo item from checked to unchecked or vice versa
@@ -284,9 +385,6 @@ function M.toggle_todo_item(todo_item, opts)
     target_state = todo_item.state == "unchecked" and "checked" or "unchecked"
   elseif target_state == todo_item.state then
     -- Already in target state, no change needed
-    if opts.notify ~= false then
-      util.notify("Todo item is already " .. target_state, log.levels.INFO)
-    end
     return true
   end
 
@@ -534,6 +632,54 @@ function M.apply_metadata(todo_item, opts)
   -- Update the line
   vim.api.nvim_buf_set_lines(bufnr, todo_row, todo_row + 1, false, { new_line })
 
+  -- Jump the cursor, if enabled
+  ---@type "tag" | "value" | false
+  local jump_to = meta_config.jump_to_on_insert or false
+
+  if jump_to ~= false then
+    local updated_line = vim.api.nvim_buf_get_lines(bufnr, todo_row, todo_row + 1, false)[1]
+    local tag_position = updated_line:find("@" .. meta_name .. "%(")
+    local value_position = tag_position and updated_line:find("%(", tag_position) + 1 or nil
+
+    -- ensure cursor movement happens after buffer update is complete
+    vim.schedule(function()
+      -- Safety checks before trying to set cursor position
+      local win = vim.api.nvim_get_current_win()
+
+      if vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_win_get_buf(win) == bufnr then
+        -- First set cursor position based on jump_to setting
+        if jump_to == "tag" and tag_position then
+          vim.api.nvim_win_set_cursor(0, { todo_row + 1, tag_position - 1 })
+
+          -- Select the tag if enabled
+          if meta_config.select_on_insert then
+            -- Force normal mode first
+            vim.cmd("stopinsert")
+            -- Select the tag text (without the @ symbol)
+            vim.cmd("normal! l" .. string.rep("l", #meta_name) .. "v" .. string.rep("h", #meta_name))
+          end
+        elseif jump_to == "value" and value_position then
+          vim.api.nvim_win_set_cursor(0, { todo_row + 1, value_position - 1 })
+
+          if meta_config.select_on_insert then
+            -- Force normal mode first
+            vim.cmd("stopinsert")
+
+            local closing_paren = updated_line:find(")", value_position)
+            if closing_paren and closing_paren > value_position then
+              -- Select everything between value_position and closing_paren-1
+              local selection_length = closing_paren - value_position
+              if selection_length > 0 then
+                -- Start visual mode and select the content
+                vim.cmd("normal! v" .. string.rep("l", selection_length - 1))
+              end
+            end
+          end
+        end
+      end
+    end)
+  end
+
   -- Call the on_add callback after successful operation
   if meta_config.on_add then
     meta_config.on_add(todo_item)
@@ -765,6 +911,11 @@ function M.apply_todo_operation(opts)
     errors = {},
   }
 
+  if not config.get_active_buffers()[bufnr] then
+    util.notify("Attempted to apply_todo_operation on non-existent buffer", log.levels.WARN)
+    return results
+  end
+
   -- Collection of todo items to process
   local todo_items = {}
 
@@ -785,20 +936,27 @@ function M.apply_todo_operation(opts)
       { module = "api" }
     )
 
+    -- Perform full parsing of buffer only once for this operation
+    local full_todo_map = parser.discover_todos(bufnr)
+
     -- Collect unique todo items in selection
-    local todo_map = {}
+    local selected_todo_map = {}
 
     for line_row = start_line, end_line do
-      local todo_item =
-        parser.get_todo_item_at_position(bufnr, line_row, 0, { max_depth = config.options.todo_action_depth })
+      local todo_item = parser.get_todo_item_at_position(
+        bufnr,
+        line_row,
+        0,
+        { todo_map = full_todo_map, max_depth = config.options.todo_action_depth }
+      )
 
       if todo_item then
         -- Create a unique key based on the marker position
         local marker_key =
           string.format("%d:%d", todo_item.todo_marker.position.row, todo_item.todo_marker.position.col)
 
-        if not todo_map[marker_key] then
-          todo_map[marker_key] = true
+        if not selected_todo_map[marker_key] then
+          selected_todo_map[marker_key] = true
           table.insert(todo_items, todo_item)
         end
       end
@@ -853,7 +1011,7 @@ function M.apply_todo_operation(opts)
       -- Notify user of results
       if opts.is_visual and results.processed > 1 then
         util.notify(
-          string.format("Checkmate: %s %d items", opts.action_name:gsub("^%l", string.upper), results.succeeded),
+          string.format("%s (%d items)", opts.action_name:gsub("^%l", string.upper), results.succeeded),
           vim.log.levels.INFO
         )
       end
@@ -888,7 +1046,7 @@ function M.count_child_todos(todo_item, todo_map, opts)
 
       -- Recursively count grandchildren
       if opts and opts.recursive then
-        local child_counts = M.count_child_todos(child, todo_map)
+        local child_counts = M.count_child_todos(child, todo_map, opts)
         counts.total = counts.total + child_counts.total
         counts.completed = counts.completed + child_counts.completed
       end
