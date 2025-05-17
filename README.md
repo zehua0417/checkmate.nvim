@@ -319,7 +319,12 @@ Enhance your todos with custom [metadata](#metadata) with quick keymaps!
 --- TODO: @field auto_fix boolean Auto fix on buffer write
 
 -----------------------------------------------------
+```
 
+</details>
+
+### Defaults
+```lua
 ---@type checkmate.Config
 local _DEFAULTS = {
   enabled = true,
