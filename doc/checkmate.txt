@@ -353,7 +353,12 @@ Config definitions/annotations ~
     --- TODO: @field auto_fix boolean Auto fix on buffer write
     
     -----------------------------------------------------
-    
+<
+
+
+DEFAULTS ~
+
+>lua
     ---@type checkmate.Config
     local _DEFAULTS = {
       enabled = true,
