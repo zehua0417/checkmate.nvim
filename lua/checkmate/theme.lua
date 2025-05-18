@@ -235,7 +235,7 @@ function M.generate_style_defaults()
   }
 
   style.unchecked_additional_content = {
-    fg = colors.comment or M.ensure_contrast(util.blend(base.fg, base.bg, 0.85), base.bg, text_contrast_ratio),
+    fg = M.ensure_contrast(util.blend(base.fg, base.bg, 0.9), base.bg, text_contrast_ratio),
   }
 
   -- Checked todos - should look "completed"
@@ -250,7 +250,7 @@ function M.generate_style_defaults()
   }
 
   style.checked_additional_content = {
-    fg = M.ensure_contrast(util.blend(base.fg, base.bg, 0.5), base.bg, dim_contrast_ratio),
+    fg = M.ensure_contrast(util.blend(base.fg, base.bg, 0.6), base.bg, dim_contrast_ratio),
   }
 
   -- For todo count indicators (e.g. "2/5" completed)
