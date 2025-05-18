@@ -59,8 +59,8 @@ https://github.com/user-attachments/assets/a8c018ac-69a4-4bf7-8ea3-ecbdf4dda661
 
 #### 1. Open or Create a Todo File
 
-- Create or open a markdown file that matches one of your configured patterns (defaults are `TODO.md`, `todo.md`, `*.todo.md`)
-- The plugin automatically activates for markdown files matching your configured patterns
+- Create or open a Markdown file that matches one of your configured patterns (defaults are `TODO.md`, `todo.md`, `*.todo.md`)
+- The plugin automatically activates for Markdown files matching your configured patterns
 
 > You can customize which files activate Checkmate using the `files` configuration option.
 
@@ -85,7 +85,7 @@ https://github.com/user-attachments/assets/a8c018ac-69a4-4bf7-8ea3-ecbdf4dda661
 
 Enhance your todos with custom [metadata](#metadata) with quick keymaps!
 
-> Your .todo file is saved as regular markdown ✔
+> The Checkmate buffer is saved as regular Markdown ✔
 
 # ☑️ Commands
 
