@@ -1,4 +1,4 @@
-*checkmate.txt*          For Neovim >= 0.10.0         Last change: 2025 May 17
+*checkmate.txt*          For Neovim >= 0.10.0         Last change: 2025 May 18
 
 ==============================================================================
 Table of Contents                                *checkmate-table-of-contents*
@@ -70,8 +70,8 @@ USING LAZY.NVIM ~
 
 1. OPEN OR CREATE A TODO FILE
 
-- Create or open a markdown file that matches one of your configured patterns (defaults are `TODO.md`, `todo.md`, `*.todo.md`)
-- The plugin automatically activates for markdown files matching your configured patterns
+- Create or open a Markdown file that matches one of your configured patterns (defaults are `TODO.md`, `todo.md`, `*.todo.md`)
+- The plugin automatically activates for Markdown files matching your configured patterns
 
 
   You can customize which files activate Checkmate using the `files`
@@ -100,7 +100,7 @@ USING LAZY.NVIM ~
 Enhance your todos with custom |checkmate-metadata| with quick keymaps!
 
 
-  Your .todo file is saved as regular markdown
+  The Checkmate buffer is saved as regular Markdown
 
 ==============================================================================
 3. Commands                                               *checkmate-commands*
