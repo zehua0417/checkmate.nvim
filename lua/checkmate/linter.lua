@@ -220,22 +220,35 @@ local Validator = {}
 ---
 ---@return LinterRuleValidator
 function Validator.inconsistent_marker()
+  -- Track markers by parent ID and indentation level
+  local parent_indent_map = {}
+
   return {
     ---@param ctx LintContext
     validate = function(ctx)
-      -- Get existing marker type at this indentation level
-      local existing = ctx.indent_marker_map[ctx.list_item.marker_col]
+      -- Skip validation for top-level list items (allow variety at document root)
+      if not ctx.parent then
+        return false
+      end
 
-      if existing and existing.type ~= ctx.list_item.marker_type then
-        -- Compare type field to marker_type
+      -- Create a unique key based on parent row and marker column
+      -- This ensures we only compare siblings (items with the same parent)
+      local parent_key = string.format("%d:%d", ctx.parent.row, ctx.parent.marker_col)
+      local indent_key = ctx.list_item.marker_col
+
+      -- Initialize parent map if needed
+      parent_indent_map[parent_key] = parent_indent_map[parent_key] or {}
+
+      -- Check if we've seen a different marker type for siblings at this indent level
+      local existing = parent_indent_map[parent_key][indent_key]
+
+      if existing and existing ~= ctx.list_item.marker_type then
+        -- We found siblings with different marker types
         ctx.report("INCONSISTENT_MARKER", ctx.list_item.marker_col)
         return true
       else
-        -- Store both type and row
-        ctx.indent_marker_map[ctx.list_item.marker_col] = {
-          type = ctx.list_item.marker_type,
-          row = ctx.row,
-        }
+        -- Remember this marker type for siblings at this indent level
+        parent_indent_map[parent_key][indent_key] = ctx.list_item.marker_type
         return false
       end
     end,

@@ -75,8 +75,9 @@ describe("Linter", function()
 
   it("flags mixed ordered/unordered markers at same indent (INCONSISTENT_MARKER)", function()
     local content = [[
-- unordered
-1. ordered sibling ]]
+- Parent
+  - unordered
+  1. ordered sibling ]]
     local bufnr = h.create_test_buffer(content)
     local diags = run(bufnr)
 
