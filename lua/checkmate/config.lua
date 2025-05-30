@@ -4,6 +4,7 @@ local M = {}
 
 -- Namespace for plugin-related state
 M.ns = vim.api.nvim_create_namespace("checkmate")
+M.ns_todos = vim.api.nvim_create_namespace("checkmate_todos")
 
 -----------------------------------------------------
 ---Checkmate configuration
@@ -565,6 +566,11 @@ function M.notify_config_changed()
     require("checkmate.linter").setup(M.options.linter)
   end
 
+  -- Update parser's patterns
+  if package.loaded["checkmate.parser"] then
+    require("checkmate.parser").clear_pattern_cache() -- clears the pattern cache in case todo markers were changed in config
+  end
+
   -- Refresh highlights
   if package.loaded["checkmate.highlights"] then
     require("checkmate.highlights").setup_highlights()
@@ -635,10 +641,6 @@ function M.stop()
         if package.loaded["checkmate.linter"] then
           local linter = require("checkmate.linter")
           linter.disable(bufnr)
-        end
-        -- Clear highlights and caches
-        if package.loaded["checkmate.highlights"] then
-          require("checkmate.highlights").clear_line_cache(bufnr)
         end
 
         -- Reset buffer state

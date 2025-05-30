@@ -208,9 +208,9 @@ function M.build_todo_patterns(opts)
     with_capture = false,
   })
 
-  --- Build multiple full-patterns from todo_marker
-  -- @param todo_marker string: The todo marker to look for
-  -- @return string[]: List of full Lua patterns to match
+  ---Build multiple full-patterns from todo_marker
+  ---@param todo_marker string: The todo marker to look for
+  ---@return string[] patterns List of full Lua patterns to match
   local function build_patterns_with_marker(todo_marker)
     local escaped_todo = escape_literal(todo_marker)
     local patterns = {}
@@ -290,9 +290,9 @@ function M.build_markdown_checkbox_patterns(list_item_markers, checkbox_pattern)
 end
 
 ---Returns a todo_map table sorted by start row
----@generic T: table<string, checkmate.TodoItem>
+---@generic T: table<integer, checkmate.TodoItem>
 ---@param todo_map T
----@return table<string, checkmate.TodoItem>
+---@return {id: integer, item: checkmate.TodoItem}
 function M.get_sorted_todo_list(todo_map)
   -- Convert map to array of {id, item} pairs
   local todo_list = {}
@@ -417,6 +417,166 @@ function M.get_heading_string(title, level)
   level = tonumber(level) or 2
   level = math.min(math.max(level, 1), 6)
   return string.rep("#", level) .. " " .. title
+end
+
+--- Efficiently batch-read buffer lines for multiple row positions
+--- Optimizes by reading contiguous ranges in single API calls
+---@param bufnr integer Buffer number
+---@param rows integer[] Array of 0-based row numbers to read
+---@return table<integer, string> Map of row number to line content
+function M.batch_get_lines(bufnr, rows)
+  if #rows == 0 then
+    return {}
+  end
+
+  -- For small requests, just read directly
+  if #rows == 1 then
+    local lines = vim.api.nvim_buf_get_lines(bufnr, rows[1], rows[1] + 1, false)
+    return { [rows[1]] = lines[1] or "" }
+  end
+
+  -- Sort rows to find contiguous ranges
+  local sorted_rows = vim.tbl_extend("error", {}, rows)
+  table.sort(sorted_rows)
+
+  local result = {}
+  local range_start = sorted_rows[1]
+  local range_end = sorted_rows[1]
+
+  local function read_range()
+    if range_start <= range_end then
+      local lines = vim.api.nvim_buf_get_lines(bufnr, range_start, range_end + 1, false)
+      for i = 0, range_end - range_start do
+        result[range_start + i] = lines[i + 1] or ""
+      end
+    end
+  end
+
+  -- Find contiguous ranges and batch read them
+  for i = 2, #sorted_rows do
+    if sorted_rows[i] > range_end + 1 then
+      -- Gap found, read current range
+      read_range()
+      range_start = sorted_rows[i]
+      range_end = sorted_rows[i]
+    else
+      range_end = sorted_rows[i]
+    end
+  end
+
+  -- Read final range
+  read_range()
+
+  return result
+end
+
+--- Simple line cache for operations that need repeated access to same lines
+---@class LineCache
+---@field private bufnr integer
+---@field private lines table<integer, string>
+---@field get fun(self: LineCache, row: integer): string
+---@field get_many fun(self: LineCache, rows: integer[]): table<integer, string>
+local LineCache = {}
+LineCache.__index = LineCache
+
+---@param bufnr integer
+---@return LineCache
+function M.create_line_cache(bufnr)
+  local self = setmetatable({
+    bufnr = bufnr,
+    lines = {},
+  }, LineCache)
+  return self
+end
+
+---@param row integer 0-based row number
+---@return string
+function LineCache:get(row)
+  if self.lines[row] == nil then
+    local lines = vim.api.nvim_buf_get_lines(self.bufnr, row, row + 1, false)
+    self.lines[row] = lines[1] or ""
+  end
+  return self.lines[row]
+end
+
+---@param rows integer[] Array of 0-based row numbers
+---@return table<integer, string>
+function LineCache:get_many(rows)
+  -- Find which rows we need to fetch
+  local missing = {}
+  for _, row in ipairs(rows) do
+    if self.lines[row] == nil then
+      table.insert(missing, row)
+    end
+  end
+
+  -- Batch fetch missing rows
+  if #missing > 0 then
+    local fetched = M.batch_get_lines(self.bufnr, missing)
+    for row, line in pairs(fetched) do
+      self.lines[row] = line
+    end
+  end
+
+  -- Return requested rows
+  local result = {}
+  for _, row in ipairs(rows) do
+    result[row] = self.lines[row]
+  end
+  return result
+end
+
+--- Convert character position to byte position in a line
+---
+--- IMPORTANT: This function expects 0-based character position and returns 0-based byte position.
+--- Neovim APIs typically use 0-based byte positions for buffer operations.
+---
+--- @param line string The line content (UTF-8 encoded)
+--- @param char_col integer Character column (0-indexed)
+--- @return integer byte_col Byte column (0-indexed)
+function M.char_to_byte_col(line, char_col)
+  if char_col == 0 then
+    return 0
+  end
+
+  -- vim.fn.byteidx expects 0-based character index and returns 0-based byte index
+  local byte_idx = vim.fn.byteidx(line, char_col)
+
+  -- byteidx returns -1 if char_col is out of range
+  if byte_idx == -1 then
+    return #line
+  end
+
+  return byte_idx
+end
+
+--- Convert byte position to character position in a line
+---
+--- This function handles UTF-8 encoded strings where a single character may
+--- occupy multiple bytes.
+---
+--- @param line string The line content (UTF-8 encoded)
+--- @param byte_col integer Byte column (0-indexed)
+--- @return integer char_col Character column (0-indexed)
+function M.byte_to_char_col(line, byte_col)
+  if byte_col == 0 then
+    return 0
+  end
+
+  -- Clamp byte_col to valid range
+  if byte_col > #line then
+    byte_col = #line
+  end
+
+  -- vim.fn.charidx expects 0-based byte index and returns 0-based character index
+  local char_idx = vim.fn.charidx(line, byte_col)
+
+  -- charidx returns -1 if byte_col is out of range (shouldn't happen with our clamp)
+  if char_idx == -1 then
+    return vim.fn.strchars(line)
+  end
+
+  return char_idx
 end
 
 -- Cursor helper

@@ -23,27 +23,20 @@ end
 
 -- Caching
 -- To avoid redundant nvim_buf_get_lines calls during highlighting passes
-M._line_cache = {}
+---@type LineCache|nil
+M._current_line_cache = nil
 
 function M.get_buffer_line(bufnr, row)
-  -- Initialize cache if needed
-  M._line_cache[bufnr] = M._line_cache[bufnr] or {}
-
-  -- Return cached line if available
-  if M._line_cache[bufnr][row] then
-    return M._line_cache[bufnr][row]
+  -- Use current cache if available
+  if M._current_line_cache then
+    return M._current_line_cache:get(row)
   end
 
-  -- Get and cache the line
-  local lines = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)
-  local line = lines[1] or ""
-  M._line_cache[bufnr][row] = line
-
-  return line
-end
-
-function M.clear_line_cache(bufnr)
-  M._line_cache[bufnr] = {}
+  -- Fallback: create a temporary cache just for this call
+  -- This shouldn't happen in normal flow but provides safety
+  local util = require("checkmate.util")
+  local cache = util.create_line_cache(bufnr)
+  return cache:get(row)
 end
 
 ---Some highlights are created from factory functions via the config module. Instead of re-running these every time
@@ -174,7 +167,7 @@ function M.setup_highlights()
 end
 
 ---@class ApplyHighlightingOpts
----@field todo_map table<string, checkmate.TodoItem>? Will use this todo_map instead of running discover_todos
+---@field todo_map table<integer, checkmate.TodoItem>? Will use this todo_map instead of running discover_todos
 ---@field debug_reason string? Reason for call (to help debug why highlighting update was called)
 
 --- TODO: This redraws all highlights and can be expensive for large files.
@@ -187,6 +180,7 @@ function M.apply_highlighting(bufnr, opts)
   local parser = require("checkmate.parser")
   local log = require("checkmate.log")
   local profiler = require("checkmate.profiler")
+  local util = require("checkmate.util")
 
   profiler.start("highlights.apply_highlighting")
 
@@ -201,12 +195,13 @@ function M.apply_highlighting(bufnr, opts)
   -- Clear existing extmarks
   vim.api.nvim_buf_clear_namespace(bufnr, config.ns, 0, -1)
 
-  -- Clear the line cache
-  M.clear_line_cache(bufnr)
+  -- Create a line cache for this highlighting pass
+  M._current_line_cache = util.create_line_cache(bufnr)
 
   -- Discover all todo items
-  ---@type table<string, checkmate.TodoItem>
-  local todo_map = opts.todo_map or parser.discover_todos(bufnr)
+  ---@type table<integer, checkmate.TodoItem>
+  -- local todo_map = opts.todo_map or parser.discover_todos(bufnr)
+  local todo_map = opts.todo_map or parser.get_todo_map(bufnr)
 
   -- Process todo items in hierarchical order (top-down)
   for _, todo_item in pairs(todo_map) do
@@ -218,8 +213,8 @@ function M.apply_highlighting(bufnr, opts)
 
   log.debug("Highlighting applied", { module = "highlights" })
 
-  -- Clear the line cache to free memory
-  M.clear_line_cache(bufnr)
+  -- This allows garbage collection of the cache and its stored lines
+  M._current_line_cache = nil
 
   profiler.stop("highlights.apply_highlighting")
 end
@@ -230,7 +225,7 @@ end
 ---Process a todo item (and, if requested via `opts.recursive`, its descendants).
 ---@param bufnr integer Buffer number
 ---@param todo_item checkmate.TodoItem The todo item to highlight.
----@param todo_map table<string, checkmate.TodoItem> Todo map from `discover_todos`
+---@param todo_map table<integer, checkmate.TodoItem> Todo map from `discover_todos`
 ---@param opts HighlightTodoOpts? Optional settings.
 ---@return nil
 function M.highlight_todo_item(bufnr, todo_item, todo_map, opts)
@@ -436,14 +431,14 @@ function M.highlight_content(bufnr, todo_item, todo_map)
   -- First line (main content) of the todo item
   local first_row = todo_item.range.start.row
   local line = M.get_buffer_line(bufnr, first_row)
-  local marker_pos = todo_item.todo_marker.position.col
-  local marker_len = #todo_item.todo_marker.text
+  local marker_pos = todo_item.todo_marker.position.col -- byte pos
+  local marker_len = #todo_item.todo_marker.text -- byte length
 
   -- Main content highlight is everything on the first line after the marker
   -- Find content start position (after the marker)
   local main_content_start = line:find("[^%s]", marker_pos + marker_len + 1)
   if main_content_start then
-    main_content_start = main_content_start - 1
+    main_content_start = main_content_start - 1 -- convert to 0-based for extmark
     vim.api.nvim_buf_set_extmark(bufnr, config.ns, first_row, main_content_start, {
       end_row = first_row,
       end_col = #line,
@@ -483,7 +478,7 @@ end
 ---Show todo count indicator
 ---@param bufnr integer Buffer number
 ---@param todo_item checkmate.TodoItem
----@param todo_map table<string, checkmate.TodoItem>
+---@param todo_map table<integer, checkmate.TodoItem>
 function M.show_todo_count_indicator(bufnr, todo_item, todo_map)
   local config = require("checkmate.config")
 
