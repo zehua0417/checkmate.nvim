@@ -43,7 +43,7 @@ M.ns_todos = vim.api.nvim_create_namespace("checkmate_todos")
 ---May need to tweak some colors to your liking
 ---@field style checkmate.StyleSettings?
 ---
---- Depth within a todo item's hierachy from which actions (e.g. toggle) will act on the parent todo item
+--- Depth within a todo item's hierarchy from which actions (e.g. toggle) will act on the parent todo item
 --- Examples:
 --- 0 = toggle only triggered when cursor/selection includes same line as the todo item/marker
 --- 1 = toggle triggered when cursor/selection includes any direct child of todo item
@@ -52,6 +52,15 @@ M.ns_todos = vim.api.nvim_create_namespace("checkmate_todos")
 ---
 ---Enter insert mode after `:CheckmateCreate`, require("checkmate").create()
 ---@field enter_insert_after_new boolean
+---
+---Options for smart toggle behavior
+---This allows an action on one todo item to recursively affect other todo items in the hierarchy in sensible manner
+---The behavior is configurable with the following defaults:
+--- - Toggling a todo item to checked will cause all direct children todos to become checked
+--- - When all direct child todo items are checked, the parent todo will become checked
+--- - Similarly, when a child todo is unchecked, it will ensure the parent todo also becomes unchecked if it was previously checked
+--- - Unchecking a parent does not uncheck children by default. This can be changed.
+---@field smart_toggle checkmate.SmartToggleSettings
 ---
 ---Enable/disable the todo count indicator (shows number of sub-todo items completed)
 ---@field show_todo_count boolean
@@ -116,6 +125,39 @@ M.ns_todos = vim.api.nvim_create_namespace("checkmate_todos")
 ---
 ---Character used for checked items
 ---@field checked string
+
+-----------------------------------------------------
+
+---@class checkmate.SmartToggleSettings
+---Whether to enable smart toggle behavior
+---Default: true
+---@field enabled boolean?
+---
+---How checking a parent affects its children
+---  - "all_children": Check all descendants, including nested
+---  - "direct_children": Only check direct children (default)
+---  - "none": Don't propagate down
+---@field check_down "all_children"|"direct_children"|"none"?
+---
+---How unchecking a parent affects its children
+---  - "all_children": Uncheck all descendants, including nested
+---  - "direct_children": Only uncheck direct children
+---  - "none": Don't propagate down (default)
+---@field uncheck_down "all_children"|"direct_children"|"none"?
+---
+---When a parent should become checked
+---i.e, how a checked child affects its parent
+---  - "all_children": When ALL descendants are checked, including nested
+---  - "direct_children": When all direct children are checked (default)
+---  - "none": Never auto-check parents
+---@field check_up "all_children"|"direct_children"|"none"?
+---
+---When a parent should become unchecked
+---i.e, how a unchecked child affects its parent
+---  - "all_children": When ANY descendant is unchecked
+---  - "direct_children": When any direct child is unchecked (default)
+---  - "none": Never auto-uncheck parents
+---@field uncheck_up "all_children"|"direct_children"|"none"?
 
 -----------------------------------------------------
 
@@ -273,6 +315,13 @@ local _DEFAULTS = {
   style = {},
   todo_action_depth = 1, --  Depth within a todo item's hierachy from which actions (e.g. toggle) will act on the parent todo item
   enter_insert_after_new = true, -- Should enter INSERT mode after :CheckmateCreate (new todo)
+  smart_toggle = {
+    enabled = true,
+    check_down = "direct_children",
+    uncheck_down = "none",
+    check_up = "direct_children",
+    uncheck_up = "direct_children",
+  },
   show_todo_count = true,
   todo_count_position = "eol",
   todo_count_recursive = true,
