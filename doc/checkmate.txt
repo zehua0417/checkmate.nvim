@@ -1,4 +1,4 @@
-*checkmate.txt*          For Neovim >= 0.10.0         Last change: 2025 May 30
+*checkmate.txt*          For Neovim >= 0.10.0         Last change: 2025 May 31
 
 ==============================================================================
 Table of Contents                                *checkmate-table-of-contents*
