@@ -190,6 +190,8 @@ function M._setup_autocommands()
       require("checkmate.config").unregister_buffer(bufnr)
       -- Reset any API state for this buffer
       require("checkmate.api")._debounced_process_buffer_fns[bufnr] = nil
+      -- Clear the todo map cache for this buffer
+      require("checkmate.parser").todo_map_cache[bufnr] = nil
     end,
   })
 
@@ -218,107 +220,315 @@ end
 
 -- PUBLIC API --
 
----Toggle todo item state at cursor or in visual selection
+---Toggle todo item(s) state under cursor or in visual selection
 ---
 ---To set a specific todo item to a target state, use `set_todo_item`
 ---@param target_state? checkmate.TodoItemState Optional target state ("checked" or "unchecked")
+---@return boolean success
 function M.toggle(target_state)
   local api = require("checkmate.api")
-  local is_visual = require("checkmate.util").is_visual_mode()
-
-  return api.apply_todo_operation({
-    operation = api.toggle_todo_item,
-    is_visual = is_visual,
-    action_name = "toggle",
-    params = { target_state = target_state },
-  })
-end
-
----Sets a given todo item to a specific state
----@param todo_item checkmate.TodoItem
----@param target_state checkmate.TodoItemState
-function M.set_todo_item(todo_item, target_state)
-  local api = require("checkmate.api")
-  return api.toggle_todo_item(todo_item, { target_state = target_state })
-end
-
---- Set todo item to checked state
-function M.check()
-  M.toggle("checked")
-end
-
---- Set todo item to unchecked state
-function M.uncheck()
-  M.toggle("unchecked")
-end
-
---- Create a new todo item
-function M.create()
-  require("checkmate.api").create_todo()
-end
-
---- Insert a metadata tag into a todo item at the cursor or per todo in the visual selection
----@param metadata_name string Name of the metadata tag (defined in the config)
----@param value string Value contained in the tag
-function M.add_metadata(metadata_name, value)
-  local config = require("checkmate.config")
   local util = require("checkmate.util")
-  local api = require("checkmate.api")
-  local meta_config = config.options.metadata[metadata_name]
+  local transaction = require("checkmate.transaction")
+  local highlights = require("checkmate.highlights")
+  local config = require("checkmate.config")
 
-  if not meta_config then
-    util.notify("Unknown metadata tag: " .. metadata_name, vim.log.levels.WARN)
-    return
+  local profiler = require("checkmate.profiler")
+  profiler.start("M.toggle")
+
+  local smart_toggle_enabled = config.options.smart_toggle and config.options.smart_toggle.enabled
+
+  local ctx = transaction.current_context()
+  if ctx then
+    -- Queue the operation in the current transaction
+    -- If toggle() is run within an existing transaction, we will use the cursor position
+    local parser = require("checkmate.parser")
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    local todo_item =
+      parser.get_todo_item_at_position(ctx.bufnr, cursor[1] - 1, cursor[2], { todo_map = transaction._state.todo_map })
+    if todo_item then
+      if smart_toggle_enabled then
+        api.propagate_toggle(ctx, { todo_item }, transaction._state.todo_map, target_state)
+      else
+        ctx.add_op(api.toggle_state, todo_item.id, target_state)
+      end
+    end
+    profiler.stop("M.toggle")
+    return true
   end
 
   local is_visual = util.is_visual_mode()
+  local bufnr = vim.api.nvim_get_current_buf()
+  -- we go ahead a keep the parsed todo_map so that we can initialize the transaction below without it
+  -- also having to discover_todos
+  local todo_items, todo_map = api.collect_todo_items_from_selection(is_visual)
 
-  api.apply_todo_operation({
-    operation = api.apply_metadata,
-    is_visual = is_visual,
-    action_name = "add metadata",
-    params = { meta_name = metadata_name, custom_value = value },
-  })
+  transaction.run(bufnr, todo_map, function(_ctx)
+    if smart_toggle_enabled then
+      api.propagate_toggle(_ctx, todo_items, todo_map, target_state)
+    else
+      for _, item in ipairs(todo_items) do
+        _ctx.add_op(api.toggle_state, item.id, target_state)
+      end
+    end
+  end, function()
+    highlights.apply_highlighting(bufnr)
+  end)
+  profiler.stop("M.toggle")
+  return true
+end
+
+---Sets a given todo item to a specific state
+---@param todo_item checkmate.TodoItem Todo item to set state
+---@param target_state checkmate.TodoItemState
+---@return boolean success
+function M.set_todo_item(todo_item, target_state)
+  local api = require("checkmate.api")
+  local transaction = require("checkmate.transaction")
+  local config = require("checkmate.config")
+  local parser = require("checkmate.parser")
+
+  if not todo_item then
+    return false
+  end
+
+  local todo_id = todo_item.id
+  local smart_toggle_enabled = config.options.smart_toggle and config.options.smart_toggle.enabled
+
+  local ctx = transaction.current_context()
+  if ctx then
+    -- Queue the operation in the current transaction
+    if smart_toggle_enabled then
+      -- Get the current todo_map from transaction state
+      local todo_map = transaction._state.todo_map
+      api.propagate_toggle(ctx, { todo_item }, todo_map, target_state)
+    else
+      ctx.add_op(api.set_todo_item, todo_id, target_state)
+    end
+    return true
+  end
+
+  local bufnr = vim.api.nvim_get_current_buf()
+
+  -- If smart toggle is enabled, we need the todo_map
+  local todo_map = smart_toggle_enabled and parser.get_todo_map(bufnr) or nil
+
+  transaction.run(bufnr, todo_map, function(_ctx)
+    if smart_toggle_enabled and todo_map then
+      api.propagate_toggle(_ctx, { todo_item }, todo_map, target_state)
+    else
+      _ctx.add_op(api.set_todo_item, todo_id, target_state)
+    end
+  end, function()
+    require("checkmate.highlights").apply_highlighting(bufnr)
+  end)
+
+  return true
+end
+
+--- Set todo item to checked state
+---
+--- See `toggle()`
+---@return boolean success
+function M.check()
+  return M.toggle("checked")
+end
+
+--- Set todo item to unchecked state
+---
+--- See `toggle()`
+---@return boolean success
+function M.uncheck()
+  return M.toggle("unchecked")
+end
+
+--- Create a new todo item
+---@returns boolean success
+function M.create()
+  require("checkmate.api").create_todo()
+  return true
+end
+
+--- Insert a metadata tag into a todo item(s) under the cursor or per todo in the visual selection
+---@param metadata_name string Name of the metadata tag (defined in the config)
+---@param value string? Value contained in the tag
+---@return boolean success
+function M.add_metadata(metadata_name, value)
+  local api = require("checkmate.api")
+  local transaction = require("checkmate.transaction")
+  local config = require("checkmate.config")
+  local util = require("checkmate.util")
+
+  local meta_props = config.options.metadata[metadata_name]
+  if not meta_props then
+    util.notify("Unknown metadata tag: " .. metadata_name, vim.log.levels.WARN)
+    return false
+  end
+
+  local ctx = transaction.current_context()
+  if ctx then
+    -- Queue the operation in the current transaction
+    -- If add_metadata() is run within an existing transaction, we will use the cursor position
+    local parser = require("checkmate.parser")
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    local todo_item =
+      parser.get_todo_item_at_position(ctx.bufnr, cursor[1] - 1, cursor[2], { todo_map = transaction._state.todo_map })
+    if todo_item then
+      ctx.add_op(api.add_metadata, todo_item.id, metadata_name, value)
+    end
+    return true
+  end
+
+  local is_visual = util.is_visual_mode()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local todo_items, todo_map = api.collect_todo_items_from_selection(is_visual)
+
+  if #todo_items == 0 then
+    local mode_msg = is_visual and "selection" or "cursor position"
+    util.notify(string.format("No todo items found at %s", mode_msg), vim.log.levels.INFO)
+    return false
+  end
+
+  -- Begin a transaction
+  transaction.run(bufnr, todo_map, function(_ctx)
+    for _, item in ipairs(todo_items) do
+      _ctx.add_op(api.add_metadata, item.id, metadata_name, value)
+    end
+  end, function()
+    require("checkmate.highlights").apply_highlighting(bufnr)
+  end)
+  return true
 end
 
 --- Remove a metadata tag from a todo item at the cursor or per todo in the visual selection
 ---@param metadata_name string Name of the metadata tag (defined in the config)
+---@return boolean success
 function M.remove_metadata(metadata_name)
-  local is_visual = require("checkmate.util").is_visual_mode()
   local api = require("checkmate.api")
+  local util = require("checkmate.util")
+  local transaction = require("checkmate.transaction")
 
-  api.apply_todo_operation({
-    operation = api.remove_metadata,
-    is_visual = is_visual,
-    action_name = "remove metadata",
-    params = { meta_name = metadata_name },
-  })
+  local ctx = transaction.current_context()
+  if ctx then
+    -- Queue the operation in the current transaction
+    -- If remove_metadata() is run within an existing transaction, we will use the cursor position
+    local parser = require("checkmate.parser")
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    local todo_item =
+      parser.get_todo_item_at_position(ctx.bufnr, cursor[1] - 1, cursor[2], { todo_map = transaction._state.todo_map })
+    if todo_item then
+      ctx.add_op(api.remove_metadata, todo_item.id, metadata_name)
+    end
+    return true
+  end
+
+  local is_visual = require("checkmate.util").is_visual_mode()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local todo_items, todo_map = api.collect_todo_items_from_selection(is_visual)
+
+  if #todo_items == 0 then
+    local mode_msg = is_visual and "selection" or "cursor position"
+    util.notify(string.format("No todo items found at %s", mode_msg), vim.log.levels.INFO)
+    return false
+  end
+
+  transaction.run(bufnr, todo_map, function(_ctx)
+    for _, item in ipairs(todo_items) do
+      _ctx.add_op(api.remove_metadata, item.id, metadata_name)
+    end
+  end, function()
+    require("checkmate.highlights").apply_highlighting(bufnr)
+  end)
+  return true
 end
 
+---Removes all metadata from a todo item(s) under the cursor or include in visual selection
+---@return boolean success
 function M.remove_all_metadata()
-  local is_visual = require("checkmate.util").is_visual_mode()
   local api = require("checkmate.api")
+  local util = require("checkmate.util")
+  local transaction = require("checkmate.transaction")
 
-  api.apply_todo_operation({
-    operation = api.remove_all_metadata,
-    is_visual = is_visual,
-    action_name = "remove all metadata",
-  })
+  local ctx = transaction.current_context()
+  if ctx then
+    -- Queue the operation in the current transaction
+    -- If remove_all_metadata() is run within an existing transaction, we will use the cursor position
+    local parser = require("checkmate.parser")
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    local todo_item =
+      parser.get_todo_item_at_position(ctx.bufnr, cursor[1] - 1, cursor[2], { todo_map = transaction._state.todo_map })
+    if todo_item then
+      ctx.add_op(api.remove_all_metadata, todo_item.id)
+    end
+    return true
+  end
+
+  local is_visual = require("checkmate.util").is_visual_mode()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local todo_items, todo_map = api.collect_todo_items_from_selection(is_visual)
+
+  if #todo_items == 0 then
+    local mode_msg = is_visual and "selection" or "cursor position"
+    util.notify(string.format("No todo items found at %s", mode_msg), vim.log.levels.INFO)
+    return false
+  end
+
+  transaction.run(bufnr, todo_map, function(_ctx)
+    for _, item in ipairs(todo_items) do
+      _ctx.add_op(api.remove_all_metadata, item.id)
+    end
+  end, function()
+    require("checkmate.highlights").apply_highlighting(bufnr)
+  end)
+  return true
 end
 
---- Toggle a metadata tag on/off at the cursor or for each todo in the visual selection
+--- Toggle a metadata tag on/off for todo item under the cursor or for each todo in the visual selection
 ---@param meta_name string Name of the metadata tag (defined in the config)
----@param custom_value string Value contained in tag
+---@param custom_value string? (Optional) Value contained in tag. If nil, will attempt to get default value from get_value()
+---@return boolean success
 function M.toggle_metadata(meta_name, custom_value)
-  local is_visual = require("checkmate.util").is_visual_mode()
   local api = require("checkmate.api")
+  local transaction = require("checkmate.transaction")
+  local util = require("checkmate.util")
+  local profiler = require("checkmate.profiler")
 
-  return api.apply_todo_operation({
-    operation = api.toggle_metadata,
-    is_visual = is_visual,
-    action_name = "toggle metadata",
-    params = { meta_name = meta_name, custom_value = custom_value },
-  })
+  profiler.start("M.toggle_metadata")
+
+  local ctx = transaction.current_context()
+  if ctx then
+    -- Queue the operation in the current transaction
+    -- If toggle_metadata() is run within an existing transaction, we will use the cursor position
+    local parser = require("checkmate.parser")
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    local todo_item =
+      parser.get_todo_item_at_position(ctx.bufnr, cursor[1] - 1, cursor[2], { todo_map = transaction._state.todo_map })
+    if todo_item then
+      ctx.add_op(api.toggle_metadata, todo_item.id, meta_name, custom_value)
+    end
+    profiler.stop("M.toggle_metadata")
+    return true
+  end
+
+  local is_visual = require("checkmate.util").is_visual_mode()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local todo_items, todo_map = api.collect_todo_items_from_selection(is_visual)
+
+  if #todo_items == 0 then
+    local mode_msg = is_visual and "selection" or "cursor position"
+    util.notify(string.format("No todo items found at %s", mode_msg), vim.log.levels.INFO)
+    return false
+  end
+
+  transaction.run(bufnr, todo_map, function(_ctx)
+    for _, item in ipairs(todo_items) do
+      _ctx.add_op(api.toggle_metadata, item.id, meta_name, custom_value)
+    end
+  end, function()
+    require("checkmate.highlights").apply_highlighting(bufnr)
+  end)
+
+  profiler.stop("M.toggle_metadata")
+  return true
 end
 
 --- Lints the current Checkmate buffer according to the plugin's enabled custom linting rules
@@ -362,6 +572,20 @@ function M.lint(opts)
   return true, results
 end
 
+---@class ArchiveOpts
+---@field heading {title?: string, level?: integer}
+
+--- Archive checked todo items to a special section
+--- Rules:
+--- - If a parent todo is checked, all its children will be archived regardless of state
+--- - If a child todo is checked but its parent is not, the child will not be archived
+---@param opts ArchiveOpts?
+function M.archive(opts)
+  opts = opts or {}
+  local api = require("checkmate.api")
+  return api.archive_todos(opts)
+end
+
 --- Open debug log
 function M.debug_log()
   require("checkmate.log").open()
@@ -400,6 +624,7 @@ function M.debug_at_cursor()
   local msg = {
     ("Debug called at (0-index): %s:%s"):format(row, col),
     "Todo item at cursor:",
+    ("  ID: %s"):format(item.id),
     ("  State: %s"):format(item.state),
     ("  List marker: [%s]"):format(util.get_ts_node_range_string(item.list_marker.node)),
     ("  Todo marker: [%d,%d] → %s"):format(

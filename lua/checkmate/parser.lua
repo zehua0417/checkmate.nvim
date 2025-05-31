@@ -17,7 +17,7 @@ local M = {}
 ---@class checkmate.MetadataEntry
 ---@field tag string The tag name
 ---@field value string The value
----@field range {start: {row: integer, col: integer}, ['end']: {row: integer, col: integer}} Position range (0-indexed)
+---@field range checkmate.Range Position range (0-indexed)
 ---@field alias_for? string The canonical tag name if this is an alias
 ---@field position_in_line integer (1-indexed)
 
@@ -25,49 +25,117 @@ local M = {}
 ---@field entries checkmate.MetadataEntry[] List of metadata entries
 ---@field by_tag table<string, checkmate.MetadataEntry> Quick access by tag name
 
+---@class checkmate.Range
+---@field start {row: integer, col: integer}
+---@field ["end"] {row: integer, col: integer}
+
 --- @class checkmate.TodoItem
+--- Stable key. Uses extmark id positioned just prior to the todo marker.
+--- This allows tracking the same todo item across buffer modifications.
+--- @field id integer
 --- @field state checkmate.TodoItemState The todo state
 --- @field node TSNode The Treesitter node
 --- Todo item's buffer range
---- The end col is expected to be adjusted (get_semantic_range) so that it accurately reflects the end of the content
---- @field range {start: {row: integer, col: integer}, ['end']: {row: integer, col: integer}}
+--- This range is adjusted from the raw TS node range via *get_semantic_range*:
+---   - The start col is adjusted to the indentation level
+---   - The end col is adjusted so that it accurately reflects the end of the content
+--- @field range checkmate.Range
+--- @field ts_range checkmate.Range
 --- @field content_nodes ContentNodeInfo[] List of content nodes
 --- @field todo_marker TodoMarkerInfo Information about the todo marker (0-indexed position)
 --- @field list_marker ListMarkerInfo Information about the list marker (0-indexed position)
 --- @field metadata checkmate.TodoMetadata | {} Metadata for this todo item
---- @field todo_text string Text content of the todo item line (first line), may be truncated. Only for debugging.
---- @field children string[] IDs of child todo items
---- @field parent_id string? ID of parent todo item
+--- @field todo_text string Text content of the todo item line (first line), may be truncated. Only for debugging or tests.
+--- @field children integer[] IDs of child todo items
+--- @field parent_id integer? ID of parent todo item
+
+local FULL_TODO_QUERY = vim.treesitter.query.parse(
+  "markdown",
+  [[
+  (list_item) @list_item
+  (list_marker_minus) @list_marker
+  (list_marker_plus) @list_marker  
+  (list_marker_star) @list_marker
+  (list_marker_dot) @list_marker_ordered
+  (list_marker_parenthesis) @list_marker_ordered
+  (paragraph) @paragraph
+]]
+)
+
+local METADATA_PATTERN = "@([%a][%w_%-]*)%(%s*(.-)%s*%)"
 
 M.list_item_markers = { "-", "+", "*" }
 
----@param todo_marker string The todo marker character to be used to build 'todo item' patterns
-M.withDefaultListItemMarkers = function(todo_marker)
-  local util = require("checkmate.util")
-  local log = require("checkmate.log")
+local PATTERN_CACHE = {
+  checked_todo = nil,
+  unchecked_todo = nil,
+}
 
-  -- Use the new build_todo_pattern to get a pattern-building function
-  local build_patterns = util.build_todo_patterns({
-    simple_markers = M.list_item_markers,
-    use_numbered_list_markers = true,
-  })
-
-  local patterns = build_patterns(todo_marker)
-
-  -- Optional debug logging of all patterns
-  -- log.debug("Generated todo patterns for marker '" .. todo_marker .. "': " .. vim.inspect(patterns), { module = "parser" })
-
-  return patterns
+function M.clear_pattern_cache()
+  PATTERN_CACHE = {
+    checked_todo = nil,
+    unchecked_todo = nil,
+  }
 end
 
 function M.getCheckedTodoPatterns()
-  local checked_marker = require("checkmate.config").options.todo_markers.checked
-  return M.withDefaultListItemMarkers(checked_marker)
+  if not PATTERN_CACHE.checked_todo then
+    local checked_marker = require("checkmate.config").options.todo_markers.checked
+    local util = require("checkmate.util")
+    ---@type fun(marker: string): string[]
+    local build_patterns = util.build_todo_patterns({
+      simple_markers = M.list_item_markers,
+      use_numbered_list_markers = true,
+    })
+    PATTERN_CACHE.checked_todo = build_patterns(checked_marker)
+  end
+  return PATTERN_CACHE.checked_todo
 end
 
 function M.getUncheckedTodoPatterns()
-  local unchecked_marker = require("checkmate.config").options.todo_markers.unchecked
-  return M.withDefaultListItemMarkers(unchecked_marker)
+  if not PATTERN_CACHE.unchecked_todo then
+    local unchecked_marker = require("checkmate.config").options.todo_markers.unchecked
+    local util = require("checkmate.util")
+    ---@type fun(marker: string): string[]
+    local build_patterns = util.build_todo_patterns({
+      simple_markers = M.list_item_markers,
+      use_numbered_list_markers = true,
+    })
+    PATTERN_CACHE.unchecked_todo = build_patterns(unchecked_marker)
+  end
+  return PATTERN_CACHE.unchecked_todo
+end
+
+-- [buffer] -> {version: integer, current: table<integer, checkmate.TodoItem> }
+M.todo_map_cache = {}
+
+---Returns a todo map of the current buffer
+---Will hit cache if buffer has not changed since last full parse,
+---according to :changedtick
+---@param bufnr integer Buffer number
+---@return table<integer, checkmate.TodoItem>
+function M.get_todo_map(bufnr)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    vim.notify("Checkmate: Invalid buffer", vim.log.levels.ERROR)
+    return {}
+  end
+
+  local changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
+  local cache = M.todo_map_cache[bufnr]
+
+  -- Cache hit - no changes since last parse
+  if cache and changedtick == cache.version then
+    return cache.current or {}
+  end
+
+  -- Buffer changed - need fresh parse
+  local fresh_todo_map = M.discover_todos(bufnr)
+  M.todo_map_cache[bufnr] = {
+    version = changedtick,
+    current = fresh_todo_map,
+  }
+
+  return fresh_todo_map
 end
 
 --- Given a line (string), returns the todo item type either "checked" or "unchecked"
@@ -97,11 +165,17 @@ end
 
 -- Setup Treesitter queries for todo items
 function M.setup()
-  local config = require("checkmate.config")
   local highlights = require("checkmate.highlights")
   local log = require("checkmate.log")
-  log.debug("Checked pattern is: " .. table.concat(M.getCheckedTodoPatterns(), " , "))
-  log.debug("Unchecked pattern is: " .. table.concat(M.getUncheckedTodoPatterns(), " , "))
+
+  -- Clear pattern cache in case config changed
+  M.clear_pattern_cache()
+
+  -- Clear todo map cache
+  M.todo_map_cache = {}
+
+  log.debug("Checked pattern is: " .. table.concat(M.getCheckedTodoPatterns() or {}, " , "))
+  log.debug("Unchecked pattern is: " .. table.concat(M.getUncheckedTodoPatterns() or {}, " , "))
 
   local todo_query = [[
 ; Capture list items and their content for structure understanding
@@ -291,7 +365,7 @@ function M.convert_unicode_to_markdown(bufnr)
 end
 
 ---@class GetTodoItemAtPositionOpts
----@field todo_map table<string, checkmate.TodoItem>? Pre-parsed todo item map to use instead of performing within function
+---@field todo_map table<integer, checkmate.TodoItem>? Pre-parsed todo item map to use instead of performing within function
 ---@field max_depth integer? What depth should still register as a parent todo item (0 = only direct, 1 = include children, etc.)
 
 -- Function to find a todo item at a given buffer position
@@ -306,6 +380,7 @@ end
 ---@return checkmate.TodoItem? todo_item
 function M.get_todo_item_at_position(bufnr, row, col, opts)
   local log = require("checkmate.log")
+  local config = require("checkmate.config")
 
   bufnr = bufnr or vim.api.nvim_get_current_buf()
   row = row or vim.api.nvim_win_get_cursor(0)[1] - 1
@@ -321,7 +396,21 @@ function M.get_todo_item_at_position(bufnr, row, col, opts)
   opts = opts or {}
   local max_depth = opts.max_depth or 0
 
-  local todo_map = opts.todo_map or M.discover_todos(bufnr)
+  local todo_map = opts.todo_map or M.get_todo_map(bufnr)
+
+  -- First check: exact position match via extmarks
+  local extmarks = vim.api.nvim_buf_get_extmarks(bufnr, config.ns_todos, { row, 0 }, { row, -1 }, {})
+
+  for _, extmark in ipairs(extmarks) do
+    local extmark_id = extmark[1]
+    local todo_item = todo_map[extmark_id]
+    if todo_item then
+      return todo_item
+    end
+  end
+
+  -- Fallback to Treesitter-based logic
+
   local root = M.get_markdown_tree_root(bufnr)
   local node = root:named_descendant_for_range(row, col, row, col)
 
@@ -348,10 +437,17 @@ function M.get_todo_item_at_position(bufnr, row, col, opts)
 
   -- If we found a list_item node
   if list_item_node then
-    -- Get the node ID
-    local node_id = list_item_node:id()
+    local function find_todo_by_node(target_node)
+      for _, todo_item in pairs(todo_map) do
+        if todo_item.node == target_node then
+          return todo_item
+        end
+      end
+      return nil
+    end
+
     -- Check if this list_item is itself a todo item
-    local todo_item = todo_map[node_id]
+    local todo_item = find_todo_by_node(list_item_node)
 
     if todo_item then
       -- It's a todo item - check if we're on its first line
@@ -371,7 +467,7 @@ function M.get_todo_item_at_position(bufnr, row, col, opts)
       -- max_depth: how many levels we are allowed to look up for a todo item parent
       while current and depth <= max_depth do
         if current:type() == "list_item" then
-          local parent_todo = todo_map[current:id()]
+          local parent_todo = find_todo_by_node(current)
           if parent_todo then
             log.debug(string.format("Matched parent todo item at depth=%d", depth), { module = "parser" })
             return parent_todo
@@ -389,7 +485,7 @@ end
 
 --- Discovers all todo items in a buffer and builds a node map
 ---@param bufnr number Buffer number
----@return table<string, checkmate.TodoItem>  Map of all todo items with their relationships
+---@return table<integer, checkmate.TodoItem>  Map of all todo items with their relationships
 function M.discover_todos(bufnr)
   local log = require("checkmate.log")
   local config = require("checkmate.config")
@@ -399,122 +495,175 @@ function M.discover_todos(bufnr)
   profiler.start("parser.discover_todos")
 
   bufnr = bufnr or vim.api.nvim_get_current_buf()
-
-  -- Initialize the node map
-  ---@type table <string, checkmate.TodoItem>
   local todo_map = {}
 
-  -- Get the Treesitter parser for markdown
+  -- Get parser
   local parser = vim.treesitter.get_parser(bufnr, "markdown")
   if not parser then
     log.debug("No parser available for markdown", { module = "parser" })
     return todo_map
   end
 
-  -- Parse the buffer
   local tree = parser:parse()[1]
   if not tree then
     log.debug("Failed to parse buffer", { module = "parser" })
+    vim.notify("Checkmate: Failed to parse buffer", vim.log.levels.ERROR)
     return todo_map
+  end
+
+  -- Get existing extmarks
+  local existing_extmarks = vim.api.nvim_buf_get_extmarks(bufnr, config.ns_todos, 0, -1, {})
+  local extmark_by_pos = {}
+  for _, extmark in ipairs(existing_extmarks) do
+    local id, row, col = extmark[1], extmark[2], extmark[3]
+    extmark_by_pos[row .. ":" .. col] = id
   end
 
   local root = tree:root()
 
-  -- Create a query to find all list_item nodes
-  local list_item_query = vim.treesitter.query.parse(
-    "markdown",
-    [[
-    (list_item) @list_item
-  ]]
-  )
+  -- Collect all nodes in a single pass
+  local node_info = {
+    list_items = {},
+    markers_by_parent = {}, -- parent node id -> marker nodes
+    paragraphs_by_parent = {}, -- parent node id -> paragraph nodes
+  }
 
-  -- First pass: Discover all todo items
-  for _, node, _ in list_item_query:iter_captures(root, bufnr, 0, -1) do
-    -- Get node information (TS ranges are 0-indexed and end-exclusive)
-    local start_row, start_col, end_row, end_col = node:range()
-    local node_id = node:id()
+  -- Single traversal to collect all relevant nodes
+  for id, node, _ in FULL_TODO_QUERY:iter_captures(root, bufnr, 0, -1) do
+    local capture_name = FULL_TODO_QUERY.captures[id]
 
-    -- Get the first line to check if it's a todo item
-    local first_line = vim.api.nvim_buf_get_lines(bufnr, start_row, start_row + 1, false)[1] or ""
-    local todo_state = M.get_todo_item_state(first_line)
-
-    if todo_state then
-      -- This is a todo item, add it to the map
-      log.trace("Found todo item at line " .. (start_row + 1) .. ", type: " .. todo_state, { module = "parser" })
-
-      -- Create the raw range first
-      local raw_range = {
-        start = { row = start_row, col = start_col },
-        ["end"] = { row = end_row, col = end_col },
-      }
-
-      -- Get the adjusted range with proper semantic boundaries
-      -- This more meaningful range encompasses the todo content better than the quirky Treesitter technical range for a node
-      local semantic_range = util.get_semantic_range(raw_range, bufnr)
-
-      -- Find the todo marker position
-      local todo_marker = todo_state == "checked" and config.options.todo_markers.checked
-        or config.options.todo_markers.unchecked
-
-      -- Find marker position, defaulting to -1 if not found
-      local marker_col = -1
-      local todo_marker_pos = first_line:find(todo_marker, 1, true)
-      if todo_marker_pos then
-        marker_col = todo_marker_pos - 1 -- Adjust for 0-indexing
-      end
-
-      local metadata = M.extract_metadata(first_line, start_row)
-
-      -- Initialize the todo item entry
-      todo_map[node_id] = {
-        state = todo_state,
+    if capture_name == "list_item" then
+      local start_row, start_col, end_row, end_col = node:range()
+      table.insert(node_info.list_items, {
         node = node,
-        range = semantic_range,
-        todo_text = first_line,
-        content_nodes = {},
-        todo_marker = {
-          position = {
-            row = start_row,
-            col = marker_col,
-          },
-          text = todo_marker,
-        },
-        ---@diagnostic disable-next-line: assign-type-mismatch
-        list_marker = nil, -- Will be set by update_list_marker_info
-        metadata = metadata,
-        children = {}, -- Will be set in second pass, if applicable
-        parent_id = nil, -- Will be set in second pass, if applicable
-      }
-
-      -- Find and store list marker information
-      M.update_list_marker_info(node, bufnr, todo_map[node_id])
-
-      -- Find and store content nodes
-      M.update_content_nodes(node, bufnr, todo_map[node_id])
+        start_row = start_row,
+        start_col = start_col,
+        end_row = end_row,
+        end_col = end_col,
+      })
+    elseif capture_name == "list_marker" or capture_name == "list_marker_ordered" then
+      local parent = node:parent()
+      if parent then
+        local parent_id = parent:id()
+        node_info.markers_by_parent[parent_id] = node_info.markers_by_parent[parent_id] or {}
+        table.insert(node_info.markers_by_parent[parent_id], {
+          node = node,
+          type = capture_name == "list_marker_ordered" and "ordered" or "unordered",
+        })
+      end
+    elseif capture_name == "paragraph" then
+      local parent = node:parent()
+      if parent then
+        local parent_id = parent:id()
+        node_info.paragraphs_by_parent[parent_id] = node_info.paragraphs_by_parent[parent_id] or {}
+        table.insert(node_info.paragraphs_by_parent[parent_id], node)
+      end
     end
   end
 
-  -- Second pass: Build parent-child relationships
+  -- Batch read all needed lines
+  local rows_needed = {}
+  for _, item in ipairs(node_info.list_items) do
+    table.insert(rows_needed, item.start_row)
+  end
+  local first_lines = util.batch_get_lines(bufnr, rows_needed)
+
+  -- Process list items
+  for _, item in ipairs(node_info.list_items) do
+    local first_line = first_lines[item.start_row] or ""
+    local todo_state = M.get_todo_item_state(first_line)
+
+    if todo_state then
+      local start_row = item.start_row
+
+      -- Find marker position
+      local todo_marker = todo_state == "checked" and config.options.todo_markers.checked
+        or config.options.todo_markers.unchecked
+      local marker_col = 0
+      local todo_marker_byte_pos = first_line:find(todo_marker, 1, true)
+      if todo_marker_byte_pos then
+        marker_col = todo_marker_byte_pos - 1
+      end
+
+      -- Handle extmark
+      local extmark_col = marker_col
+      local pos_key = start_row .. ":" .. extmark_col
+      local extmark_id = extmark_by_pos[pos_key]
+
+      if not extmark_id then
+        extmark_id = vim.api.nvim_buf_set_extmark(bufnr, config.ns_todos, start_row, extmark_col, {
+          right_gravity = false,
+        })
+      end
+      extmark_by_pos[pos_key] = nil
+
+      -- Create ranges
+      local raw_range = {
+        start = { row = start_row, col = item.start_col },
+        ["end"] = { row = item.end_row, col = item.end_col },
+      }
+      local semantic_range = util.get_semantic_range(raw_range, bufnr)
+
+      -- Get list marker from pre-collected data
+      local list_marker = nil
+      local node_id = item.node:id()
+      local markers = node_info.markers_by_parent[node_id]
+      if markers and #markers > 0 then
+        list_marker = {
+          node = markers[1].node,
+          type = markers[1].type,
+        }
+      end
+
+      -- Get content nodes from pre-collected data
+      local content_nodes = {}
+      local paragraphs = node_info.paragraphs_by_parent[node_id]
+      if paragraphs then
+        for _, p_node in ipairs(paragraphs) do
+          table.insert(content_nodes, {
+            node = p_node,
+            type = "paragraph",
+          })
+        end
+      end
+
+      -- Create todo item
+      todo_map[extmark_id] = {
+        id = extmark_id,
+        state = todo_state,
+        node = item.node,
+        range = semantic_range,
+        ts_range = raw_range,
+        todo_text = first_line,
+        content_nodes = content_nodes,
+        todo_marker = {
+          position = { row = start_row, col = marker_col },
+          text = todo_marker,
+        },
+        list_marker = list_marker,
+        metadata = M.extract_metadata(first_line, start_row),
+        children = {},
+        parent_id = nil,
+      }
+    end
+  end
+
+  -- Clean up orphaned extmarks
+  for _, orphaned_id in pairs(extmark_by_pos) do
+    vim.api.nvim_buf_del_extmark(bufnr, config.ns_todos, orphaned_id)
+  end
+
+  -- Build hierarchy
   M.build_todo_hierarchy(todo_map)
 
   profiler.stop("parser.discover_todos")
-
   return todo_map
 end
 
 ---Returns a TS query for finding markdown list_markers
 ---@return vim.treesitter.Query
 function M.get_list_marker_query()
-  return vim.treesitter.query.parse(
-    "markdown",
-    [[
-    (list_marker_minus) @list_marker_minus
-    (list_marker_plus) @list_marker_plus
-    (list_marker_star) @list_marker_star
-    (list_marker_dot) @list_marker_ordered
-    (list_marker_parenthesis) @list_marker_ordered
-    ]]
-  )
+  return FULL_TODO_QUERY
 end
 
 ---Returns the list_marker type as "unordered" or "ordered"
@@ -554,6 +703,35 @@ function M.update_list_marker_info(node, bufnr, todo_item)
   end
 end
 
+---Finds the markdown list_marker associated with the given node
+---@param node TSNode The list_item node of a todo item
+---@param bufnr integer Buffer number
+---@return ListMarkerInfo|nil
+function M.find_list_marker_info(node, bufnr)
+  -- Find all child nodes that could be list markers
+  local list_marker_query = M.get_list_marker_query()
+
+  for id, marker_node, _ in list_marker_query:iter_captures(node, bufnr, 0, -1) do
+    local name = list_marker_query.captures[id]
+    local marker_type = M.get_marker_type_from_capture_name(name)
+
+    -- Verify this marker is a direct child of this list_item
+    local parent = marker_node:parent()
+    while parent and parent ~= node do
+      parent = parent:parent()
+    end
+
+    if parent == node then
+      return {
+        node = marker_node,
+        type = marker_type,
+      }
+    end
+  end
+
+  return nil
+end
+
 -- Find content nodes (paragraphs, etc.)
 function M.update_content_nodes(node, bufnr, todo_item)
   -- Find child nodes containing content
@@ -577,46 +755,43 @@ function M.update_content_nodes(node, bufnr, todo_item)
 end
 
 ---Build the hierarchy of todo items based on Treesitter's parsing of markdown structure
----@param todo_map table<string, checkmate.TodoItem>
----@return table<string, checkmate.TodoItem> result The updated todo map with hierarchy information
+---@param todo_map table<integer, checkmate.TodoItem>
+---@return table<integer, checkmate.TodoItem> result The updated todo map with hierarchy information
 function M.build_todo_hierarchy(todo_map)
-  local log = require("checkmate.log")
-
-  -- Reset all children arrays and parent_ids
-  for _, item in pairs(todo_map) do
-    item.children = {}
-    item.parent_id = nil
+  -- Build node->todo lookup table once
+  local node_to_todo = {}
+  for id, todo in pairs(todo_map) do
+    node_to_todo[todo.node:id()] = id
+    todo.children = {}
+    todo.parent_id = nil
   end
 
-  -- Build parent-child relationships based on Treesitter tree structure
-  for id, todo_item in pairs(todo_map) do
-    local node = todo_item.node
-
-    -- Find the parent list_item node using Treesitter's structure
-    local parent_node = M.find_parent_list_item(node)
-
-    -- If a parent exists, establish the relationship
+  -- Single pass to build relationships
+  for id, todo in pairs(todo_map) do
+    local parent_node = M.find_parent_list_item(todo.node)
     if parent_node then
-      local parent_id = parent_node:id()
-
-      -- Only set parent if it's a todo item
-      if todo_map[parent_id] then
-        todo_item.parent_id = parent_id
+      local parent_id = node_to_todo[parent_node:id()]
+      if parent_id then
+        todo.parent_id = parent_id
         table.insert(todo_map[parent_id].children, id)
-
-        log.debug(
-          string.format(
-            "Parent-child relationship: '%s' is parent of '%s'",
-            todo_map[parent_id].todo_text:sub(1, 20),
-            todo_item.todo_text:sub(1, 20)
-          ),
-          { module = "parser" }
-        )
       end
     end
   end
 
   return todo_map
+end
+
+--- Get current position of a todo item via its extmark
+---@param bufnr integer
+---@param extmark_id integer
+---@return {row: integer, col: integer}|nil
+function M.get_todo_position(bufnr, extmark_id)
+  local config = require("checkmate.config")
+  local extmark = vim.api.nvim_buf_get_extmark_by_id(bufnr, config.ns_todos, extmark_id, {})
+  if extmark then
+    return { row = extmark[1], col = extmark[2] }
+  end
+  return nil
 end
 
 function M.get_markdown_tree_root(bufnr)
@@ -641,21 +816,20 @@ end
 function M.extract_metadata(line, row)
   local log = require("checkmate.log")
   local config = require("checkmate.config")
+  local util = require("checkmate.util")
 
   ---@type checkmate.TodoMetadata
   local metadata = {
     entries = {},
     by_tag = {},
   }
-  ---Tags must begin with a letter, but can then contain letters, digits, underscores, or hyphens
-  local tag_value_pattern = "@([%a][%w_%-]*)%(%s*(.-)%s*%)"
 
   -- Find all @tag(value) patterns and their positions
-  local pos = 1
+  local byte_pos = 1
   while true do
     -- Will capture tag names that include underscores and hypens
-    local tag_start, tag_end, tag, value = line:find(tag_value_pattern, pos)
-    if not tag_start or not tag_end then
+    local tag_start_byte, tag_end_byte, tag, value = line:find(METADATA_PATTERN, byte_pos)
+    if not tag_start_byte or not tag_end_byte then
       break
     end
 
@@ -665,13 +839,13 @@ function M.extract_metadata(line, row)
       tag = tag,
       value = value,
       range = {
-        start = { row = row, col = tag_start - 1 }, -- 0-indexed column
+        start = { row = row, col = tag_start_byte - 1 }, -- 0-indexed column
         -- For the end col, we need 0 indexed (subtract 1) and since it is end-exclusive we add 1, cancelling out
         -- end-exclusive means the end col points to the pos after the last char
-        ["end"] = { row = row, col = tag_end },
+        ["end"] = { row = row, col = tag_end_byte },
       },
       alias_for = nil, -- Will be set later if it's an alias
-      position_in_line = tag_start, -- track original position in the line
+      position_in_line = tag_start_byte, -- track original position in the line, use byte pos for sorting
     }
 
     -- Check if this is an alias and map to canonical name
@@ -706,10 +880,10 @@ function M.extract_metadata(line, row)
     end
 
     -- Move position for next search
-    pos = tag_end + 1
+    byte_pos = tag_end_byte + 1
 
     log.debug(
-      string.format("Metadata found: %s=%s at [%d,%d]-[%d,%d]", tag, value, row, tag_start - 1, row, tag_end),
+      string.format("Metadata found: %s=%s at [%d,%d]-[%d,%d]", tag, value, row, tag_start_byte - 1, row, tag_end_byte),
       { module = "parser" }
     )
   end
