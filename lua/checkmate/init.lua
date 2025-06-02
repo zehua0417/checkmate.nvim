@@ -21,68 +21,41 @@ function M.should_activate_for_buffer(bufnr, patterns)
     return false
   end
 
-  -- Normalize path for consistent matching
   local norm_path = filename:gsub("\\", "/")
   local basename = vim.fn.fnamemodify(norm_path, ":t")
+  local basename_no_ext = vim.fn.fnamemodify(basename, ":r")
 
   for _, pattern in ipairs(patterns) do
-    if pattern == basename then
+    -- Lua Pattern match (user-supplied pattern)
+    local ok_path_match = pcall(string.match, norm_path, pattern)
+    local ok_base_match = pcall(string.match, basename_no_ext, pattern)
+
+    if ok_path_match and norm_path:match(pattern) == norm_path then
+      return true
+    end
+    if ok_base_match and basename:match(pattern) == basename_no_ext then
       return true
     end
 
-    -- if pattern has no extension and file has .md extension,
-    -- check if pattern matches filename without extension
+    -- Filename without extension (e.g. "daily" matching "daily.md")
     if not pattern:match("%.%w+$") and basename:match("%.md$") then
-      local basename_no_ext = vim.fn.fnamemodify(basename, ":r")
-      if pattern == basename_no_ext then
+      if basename_no_ext == pattern then
         return true
       end
     end
 
-    -- for directory patterns
-    if pattern:find("/") then
-      if norm_path:match("/" .. vim.pesc(pattern) .. "$") then
-        return true
-      end
-
-      -- if pattern doesn't end with .md and the file has .md extension,
-      -- check if adding .md to the pattern would match
-      if not pattern:match("%.md$") and norm_path:match("%.md$") then
-        if norm_path:match("/" .. vim.pesc(pattern) .. "%.md$") then
-          return true
-        end
-      end
-    end
-
-    -- Wildcard matching
+    -- Fallback glob-like support: *.todo etc
     if pattern:find("*") then
       local lua_pattern = vim.pesc(pattern):gsub("%%%*", ".*")
 
-      if pattern:find("/") then
-        if norm_path:match(lua_pattern .. "$") then
-          return true
-        end
-
-        -- try with .md added if pattern doesn't have extension and file does
-        if not pattern:match("%.%w+$") and norm_path:match("%.md$") then
-          if norm_path:match(lua_pattern .. "%.md$") then
-            return true
-          end
-        end
-      else
-        -- simple filename patterns with wildcards
-        if basename:match("^" .. lua_pattern .. "$") then
-          return true
-        end
-
-        -- if pattern doesn't have extension and file has .md extension,
-        -- try to match pattern against filename without extension
-        if not pattern:match("%.%w+$") and basename:match("%.md$") then
-          local basename_no_ext = vim.fn.fnamemodify(basename, ":r")
-          if basename_no_ext:match("^" .. lua_pattern .. "$") then
-            return true
-          end
-        end
+      if norm_path:match(lua_pattern .. "$") then
+        return true
+      end
+      if basename:match("^" .. lua_pattern .. "$") then
+        return true
+      end
+      if basename_no_ext:match("^" .. lua_pattern .. "$") then
+        return true
       end
     end
   end
